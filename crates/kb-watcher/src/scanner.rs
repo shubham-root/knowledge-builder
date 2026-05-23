@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::events::CandidatePath;
+use crate::events::WatchEvent;
 
 /// Start the periodic scanner.
 ///
@@ -21,7 +21,7 @@ pub async fn start(
     _extensions:         Vec<String>,
     _ignore_globs:       Vec<String>,
     _poll_interval_secs: u64,
-    _candidate_tx:       mpsc::Sender<CandidatePath>,
+    _event_tx:           mpsc::Sender<WatchEvent>,
 ) -> kb_core::Result<()> {
     // TODO (T22): implement walkdir loop.
     tracing::debug!("scanner stub — not yet implemented");

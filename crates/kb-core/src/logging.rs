@@ -62,7 +62,7 @@ use crate::config::OpsConfig;
 ///
 /// Store this value in a variable bound for the lifetime of `main`:
 ///
-/// ```no_run
+/// ```ignore
 /// let _guard = init_logging(...)?;
 /// // guard dropped here → flushes pending log lines
 /// ```
