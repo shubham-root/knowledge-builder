@@ -52,3 +52,20 @@ pub use types::{
 /// Crate-level `Result` alias: all fallible functions return
 /// `kb_core::Result<T>` which is `anyhow::Result<T>` under the hood.
 pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
+
+// ── Config re-exports ─────────────────────────────────────────────────────────
+//
+// The most-used config surface is available directly from `kb_core::` so
+// callers can write `kb_core::Config::load()` without the full module path.
+
+pub use config::{
+    Config,
+    ConfigError,
+    ConfigErrors,
+    PathsConfig,
+    WatchConfig,
+    WorkerConfig,
+    ProcessorConfig,
+    OpsConfig,
+    load_raw,
+};
