@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kb-core",
+    "crates/kb-watcher",
+    "crates/kb-worker",
+    "crates/kb-ops",
+    "crates/kb-cli",
+]
+
+# ── Shared dependency versions ────────────────────────────────────────────────
+# All crates inherit from here via `{ workspace = true }`.
+# Only the fields that differ per-crate (features, optional) are overridden
+# in each crate's own Cargo.toml.
+[workspace.dependencies]
+
+# Async runtime
+tokio            = { version = "1",    features = ["full"] }
+
+# Serialization
+serde            = { version = "1",    features = ["derive"] }
+serde_json       = { version = "1" }
+
+# Error handling
+thiserror        = { version = "2" }
+anyhow           = { version = "1" }
+
+# Logging / tracing
+tracing          = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = { version = "0.2" }
+
+# SQLite (statically linked)
+rusqlite         = { version = "0.32", features = ["bundled"] }
+
+# Configuration
+figment          = { version = "0.10", features = ["toml", "env"] }
+
+# Hashing
+sha2             = { version = "0.10" }
+digest           = { version = "0.10" }
+
+# Platform / utility
+dirs             = { version = "5" }
+chrono           = { version = "0.4",  features = ["serde"] }
+fs2              = { version = "0.4" }
+
+# File watching (FSEvents backend on macOS)
+notify                 = { version = "6" }
+notify-debouncer-full  = { version = "0.3" }
+
+# Directory walking & glob matching
+walkdir          = { version = "2" }
+globset          = { version = "0.4" }
+
+# HTTP server
+axum             = { version = "0.8" }
+tower            = { version = "0.5", features = ["full"] }
+tower-http       = { version = "0.6", features = ["trace", "cors"] }
+
+# CLI argument parsing
+clap             = { version = "4",    features = ["derive"] }
+
+# Async stream utilities (used by kb-ops SSE)
+futures-util     = { version = "0.3", default-features = false, features = ["std"] }
+
+# Inter-crate dependencies
+kb-core    = { path = "crates/kb-core" }
+kb-watcher = { path = "crates/kb-watcher" }
+kb-worker  = { path = "crates/kb-worker" }
+kb-ops     = { path = "crates/kb-ops" }

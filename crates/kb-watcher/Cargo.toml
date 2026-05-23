@@ -1,0 +1,32 @@
+[package]
+name        = "kb-watcher"
+version     = "0.1.0"
+edition     = "2021"
+description = "File detection: FSEvents watcher, stability tracker, SHA-256 hasher, periodic scanner"
+
+[dependencies]
+kb-core = { workspace = true }
+
+# File watching — FSEvents backend on macOS
+notify                = { workspace = true }
+notify-debouncer-full = { workspace = true }
+
+# Directory walking & glob filtering
+walkdir  = { workspace = true }
+globset  = { workspace = true }
+
+# Hashing
+sha2   = { workspace = true }
+digest = { workspace = true }
+
+# Async + serialization
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+
+# Logging
+tracing = { workspace = true }

@@ -1,0 +1,33 @@
+[package]
+name        = "kb-cli"
+version     = "0.1.0"
+edition     = "2021"
+description = "The `kb` binary: daemon entrypoint and all operational subcommands"
+
+[[bin]]
+name = "kb"
+path = "src/main.rs"
+
+[dependencies]
+kb-core    = { workspace = true }
+kb-watcher = { workspace = true }
+kb-worker  = { workspace = true }
+kb-ops     = { workspace = true }
+
+# CLI argument parsing
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Platform helpers (config path)
+dirs = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }

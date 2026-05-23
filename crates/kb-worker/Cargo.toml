@@ -1,0 +1,22 @@
+[package]
+name        = "kb-worker"
+version     = "0.1.0"
+edition     = "2021"
+description = "Job execution: worker pool, subprocess invocation, JSON result parsing, output validation"
+
+[dependencies]
+kb-core = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
