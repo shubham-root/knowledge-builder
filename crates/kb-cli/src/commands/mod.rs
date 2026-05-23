@@ -1,6 +1,7 @@
 //! Subcommand modules for the `kb` CLI.
 
 pub mod config;
+pub(crate) mod db;
 pub mod daemon;
 pub mod doctor;
 pub mod install;

@@ -29,5 +29,8 @@ dirs = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 
+# Time formatting
+chrono = { workspace = true }
+
 # Logging
 tracing = { workspace = true }

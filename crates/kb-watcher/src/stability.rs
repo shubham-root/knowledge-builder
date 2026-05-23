@@ -13,6 +13,11 @@
 //! New paths are fed into the task through an `mpsc` channel, meaning callers
 //! in any other task can enqueue paths concurrently.
 //!
+//! The task keeps a "keepalive" clone of the sender alive for its own
+//! lifetime, so the channel is never closed prematurely (i.e., the task runs
+//! until the tokio runtime shuts down, not until the caller drops their
+//! sender).
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -133,13 +138,13 @@ impl StabilityTracker {
     /// # use kb_watcher::stability::StabilityTracker;
     /// # use tokio::sync::mpsc;
     /// # use kb_watcher::stability::StableFile;
-    /// # tokio_test::block_on(async {
+    /// # #[tokio::main] async fn main() {
     /// let (out_tx, _out_rx) = mpsc::channel::<StableFile>(64);
     /// let tracker = StabilityTracker::new(2_000, 500);
     /// let sender  = tracker.sender();          // clone before run()
     /// let _handle = tracker.run(out_tx);       // self consumed
     /// sender.send(std::path::PathBuf::from("/tmp/foo.pdf")).await.ok();
-    /// # });
+    /// # }
     /// ```
     pub fn sender(&self) -> mpsc::Sender<PathBuf> {
         self.track_tx.clone()
@@ -155,15 +160,32 @@ impl StabilityTracker {
     /// - Gives up on paths that are still unstable after `5 × stability_ms`
     ///   (logged at `WARN`).
     ///
-    /// The task exits when the input channel is closed (all [`Sender`] handles
-    /// are dropped).
+    /// The task holds a keepalive clone of the sender internally, so it runs
+    /// until the tokio runtime shuts down — not until the caller drops their
+    /// last sender.  This prevents premature channel closure in the common
+    /// pattern of calling [`track`] before [`run`] without retaining a
+    /// sender.
     pub fn run(self, output: mpsc::Sender<StableFile>) -> JoinHandle<()> {
-        let stability_dur = Duration::from_millis(self.stability_ms);
-        let max_wait_dur = Duration::from_millis(self.stability_ms.saturating_mul(5));
-        let poll_dur = Duration::from_millis(self.poll_interval_ms);
-        let mut track_rx = self.track_rx;
+        // Destructure so we can move all fields into the closure independently.
+        let StabilityTracker {
+            stability_ms,
+            poll_interval_ms,
+            track_tx,
+            track_rx,
+        } = self;
+
+        let stability_dur = Duration::from_millis(stability_ms);
+        let max_wait_dur = Duration::from_millis(stability_ms.saturating_mul(5));
+        let poll_dur = Duration::from_millis(poll_interval_ms);
+        let mut track_rx = track_rx;
 
         tokio::spawn(async move {
+            // Hold one sender clone alive for the task's lifetime.
+            // This prevents the channel from closing when the external caller
+            // does not retain a sender (e.g. after calling track() then run()
+            // without saving sender()).
+            let _keepalive = track_tx;
+
             let mut states: HashMap<PathBuf, FileState> = HashMap::new();
             let mut ticker = time::interval(poll_dur);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -176,8 +198,8 @@ impl StabilityTracker {
                         // so a freshly-added file isn't missed this tick.
                         loop {
                             match track_rx.try_recv() {
-                                Ok(path)  => Self::on_new_path(path, &mut states),
-                                Err(_)    => break,
+                                Ok(path) => Self::on_new_path(path, &mut states),
+                                Err(_)   => break,
                             }
                         }
 
@@ -186,12 +208,16 @@ impl StabilityTracker {
                             stability_dur,
                             max_wait_dur,
                             &output,
-                        ).await;
+                        )
+                        .await;
                     }
 
-                    // New path to begin tracking.
+                    // New path to begin tracking (between ticks).
                     msg = track_rx.recv() => {
                         match msg {
+                            // Dead code while keepalive is alive, but kept
+                            // for correctness (e.g. if the keepalive is ever
+                            // removed or an abort is signalled).
                             None => {
                                 tracing::debug!(
                                     "stability tracker: all senders dropped; \
@@ -209,10 +235,13 @@ impl StabilityTracker {
 
     // ── Private helpers ───────────────────────────────────────────────────
 
-    /// Handle a newly submitted path.
+    /// Handle a newly submitted path: stat it and insert into the state map.
     fn on_new_path(path: PathBuf, states: &mut HashMap<PathBuf, FileState>) {
         if states.contains_key(&path) {
-            tracing::trace!(?path, "stability: already tracking; ignoring duplicate");
+            tracing::trace!(
+                ?path,
+                "stability: already tracking; ignoring duplicate submission"
+            );
             return;
         }
 
@@ -356,8 +385,8 @@ impl StabilityTracker {
             states.remove(&path);
         }
 
-        // Emit stable events.  We do this after the loop to avoid holding a
-        // mutable borrow on `states` across `.await` points.
+        // Emit stable events.  Done after the loop to avoid holding a mutable
+        // borrow on `states` across `.await` points.
         for sf in to_emit {
             if output.send(sf).await.is_err() {
                 tracing::warn!("stability: output channel closed; stable event dropped");
@@ -419,8 +448,8 @@ pub async fn wait_for_stable(
             mtime_ns: sf.mtime_ns,
             inode: sf.inode,
         },
-        Ok(None) => StabilityOutcome::Disappeared,
-        Err(_)   => StabilityOutcome::Timeout,
+        Ok(None)   => StabilityOutcome::Disappeared,
+        Err(_)     => StabilityOutcome::Timeout,
     }
 }
 
@@ -436,17 +465,33 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
-    /// Helper: create a tracker with faster timing for tests.
-    ///
-    /// - stability_ms = 400  (file must be unchanged for 400 ms)
-    /// - poll_interval_ms = 80
-    fn fast_tracker() -> StabilityTracker {
-        StabilityTracker::new(400, 80)
+    // ── Test timings ──────────────────────────────────────────────────────
+    //
+    // These constants are chosen to be fast in CI while remaining robust:
+    //
+    //   stability_ms     = 500 ms   — file must be unchanged for 500 ms
+    //   poll_interval_ms = 80  ms   — poll cadence
+    //   WRITE_INTERVAL   = 150 ms   — write cadence in the "active writes" test
+    //   WRITE_COUNT      = 6        — number of writes (total write span ≈ 900 ms)
+    //   STABLE_TIMEOUT   = 5  s     — max time to wait for a stable event
+    //
+    // The "no premature stable" window is WRITE_INTERVAL × WRITE_COUNT minus
+    // a small safety margin, so the assertion fires before the last write
+    // completes and before any stability window can expire.
+
+    const STABILITY_MS: u64 = 500;
+    const POLL_MS: u64 = 80;
+    const WRITE_INTERVAL_MS: u64 = 150;
+    const WRITE_COUNT: u8 = 6;
+
+    fn make_tracker() -> StabilityTracker {
+        StabilityTracker::new(STABILITY_MS, POLL_MS)
     }
 
     // ── Test 1: a quiescent file becomes stable ───────────────────────────
 
-    /// Create a file, track it, verify a [`StableFile`] is emitted.
+    /// Create a file, track it, verify a [`StableFile`] is emitted within the
+    /// expected time window.
     #[tokio::test]
     async fn file_becomes_stable_after_quiet_period() {
         let mut tmp = NamedTempFile::new().expect("tempfile");
@@ -456,16 +501,18 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let (out_tx, mut out_rx) = mpsc::channel::<StableFile>(4);
-        let mut tracker = fast_tracker();
+        let mut tracker = make_tracker();
         tracker.track(path.clone());
         let _handle = tracker.run(out_tx);
 
-        // Wait up to 4 s — should arrive well within stability_ms + a few ticks.
-        let result = timeout(Duration::from_secs(4), out_rx.recv()).await;
-        assert!(result.is_ok(), "timed out waiting for stable event");
+        // Wait up to 5 s — the file should stabilise well within
+        // STABILITY_MS + a couple of poll ticks ≈ 700 ms.
+        let result = timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("timed out waiting for stable event");
 
-        let sf = result.unwrap().expect("channel closed unexpectedly");
-        assert_eq!(sf.path, path, "wrong path in StableFile");
+        let sf = result.expect("output channel closed unexpectedly");
+        assert_eq!(sf.path, path, "StableFile has wrong path");
         assert!(sf.size > 0, "size should be non-zero");
         assert!(sf.mtime_ns > 0, "mtime_ns should be non-zero");
         #[cfg(unix)]
@@ -474,70 +521,99 @@ mod tests {
 
     // ── Test 2: an actively-written file does NOT stabilise until writes stop
 
-    /// Keep writing to a file every 150 ms.  Verify no stable event is emitted
-    /// during the write window, then one arrives after writes stop.
+    /// Keep writing to a file every WRITE_INTERVAL_MS.  Assert that no stable
+    /// event arrives while writes are in progress, then one arrives shortly
+    /// after writes stop.
     #[tokio::test]
     async fn actively_written_file_does_not_stabilise_until_writes_stop() {
         let tmp = NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
 
         let (out_tx, mut out_rx) = mpsc::channel::<StableFile>(4);
-        let mut tracker = fast_tracker();
+        let mut tracker = make_tracker();
         tracker.track(path.clone());
         let _handle = tracker.run(out_tx);
 
-        // Write to the file every 100 ms for 600 ms (1.5× stability_ms = 600 ms).
+        // Total write span: WRITE_COUNT × WRITE_INTERVAL_MS.
+        // Each write resets the stability timer so the file cannot stabilise
+        // until STABILITY_MS after the *last* write.
         let write_path = path.clone();
         let writer = tokio::spawn(async move {
-            for i in 0u8..6 {
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&write_path)
-                    .unwrap();
-                writeln!(f, "write {i}").unwrap();
-                f.sync_all().unwrap();
-                drop(f);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            for i in 0..WRITE_COUNT {
+                {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .append(true)
+                        .open(&write_path)
+                        .unwrap();
+                    writeln!(f, "write {i}").unwrap();
+                    f.sync_all().unwrap();
+                } // drop file handle before sleeping
+                tokio::time::sleep(Duration::from_millis(WRITE_INTERVAL_MS)).await;
             }
         });
 
-        // During the write window no stable event should arrive.
-        let no_event = timeout(Duration::from_millis(550), out_rx.recv()).await;
+        // The stable event must NOT arrive while writes are still in progress.
+        // We check a window slightly shorter than the total write span so that
+        // the assertion fires before the last write completes.
+        let write_span_ms = (WRITE_COUNT as u64) * WRITE_INTERVAL_MS;
+        let guard_window_ms = write_span_ms.saturating_sub(WRITE_INTERVAL_MS / 2);
+
+        let no_event = timeout(
+            Duration::from_millis(guard_window_ms),
+            out_rx.recv(),
+        )
+        .await;
         assert!(
             no_event.is_err(),
             "got premature stable event while file was still being written"
         );
 
-        // Wait for writes to finish.
+        // Wait for all writes to complete.
         writer.await.unwrap();
 
-        // Now the file should stabilise.
-        let result = timeout(Duration::from_secs(4), out_rx.recv()).await;
-        assert!(result.is_ok(), "timed out waiting for stable event after writes stopped");
-        let sf = result.unwrap().expect("channel closed unexpectedly");
-        assert_eq!(sf.path, path);
+        // The file is now quiescent; it should stabilise within STABILITY_MS
+        // plus a few poll ticks.
+        let result = timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("timed out waiting for stable event after writes stopped");
+
+        let sf = result.expect("output channel closed unexpectedly");
+        assert_eq!(sf.path, path, "StableFile has wrong path");
     }
 
     // ── Test 3: a deleted file is silently dropped ────────────────────────
 
-    /// Track a file, then immediately delete it.  The tracker should NOT emit
-    /// a [`StableFile`]; it should drop the entry after detecting disappearance.
+    /// Track a file then delete it.  The tracker must NOT emit a [`StableFile`].
+    ///
+    /// We use a large stability window (5× STABILITY_MS) to make the test
+    /// robust against scheduler delays: even if the poll is significantly late,
+    /// the stability window will not expire before the file is detected as gone.
     #[tokio::test]
     async fn deleted_file_is_dropped_without_emitting_stable() {
+        // Use a large stability window so the file can never accidentally
+        // become "stable" before it is detected as deleted.
+        let stability_ms = STABILITY_MS * 5; // 2500 ms
         let tmp = NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
 
         let (out_tx, mut out_rx) = mpsc::channel::<StableFile>(4);
-        let mut tracker = fast_tracker();
+        let mut tracker = StabilityTracker::new(stability_ms, POLL_MS);
         tracker.track(path.clone());
         let _handle = tracker.run(out_tx);
 
-        // Delete the file almost immediately (before any stability window).
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Give the tracker time to observe the file on its first tick, then
+        // delete it well within the (large) stability window.
+        tokio::time::sleep(Duration::from_millis(POLL_MS * 2)).await;
         drop(tmp); // NamedTempFile removes the file on drop
 
-        // Wait well past the stability window — no event should arrive.
-        let result = timeout(Duration::from_millis(1_500), out_rx.recv()).await;
+        // Wait for longer than stability_ms; no event should arrive because
+        // the file was removed before the stability window elapsed.
+        let result = timeout(
+            Duration::from_millis(stability_ms + 500),
+            out_rx.recv(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "unexpected stable event emitted for a deleted file"
@@ -547,6 +623,7 @@ mod tests {
     // ── Test 4: concurrent track() calls via sender ───────────────────────
 
     /// Add paths via the cloned sender after `run()` has consumed the tracker.
+    /// Both files should stabilise.
     #[tokio::test]
     async fn concurrent_track_via_sender() {
         let mut tmp1 = NamedTempFile::new().unwrap();
@@ -561,8 +638,8 @@ mod tests {
         let path2 = tmp2.path().to_path_buf();
 
         let (out_tx, mut out_rx) = mpsc::channel::<StableFile>(8);
-        let tracker = fast_tracker();
-        let sender  = tracker.sender();
+        let tracker = make_tracker();
+        let sender = tracker.sender();
         let _handle = tracker.run(out_tx);
 
         // Submit both paths via the sender (simulates concurrent callers).
@@ -572,21 +649,22 @@ mod tests {
         let mut received: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
 
-        // Expect two stable events.
+        // Expect exactly two stable events.
         for _ in 0..2 {
-            let result = timeout(Duration::from_secs(4), out_rx.recv()).await;
-            assert!(result.is_ok(), "timed out waiting for stable event");
-            let sf = result.unwrap().expect("channel unexpectedly closed");
+            let sf = timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("timed out waiting for stable event")
+                .expect("output channel closed unexpectedly");
             received.insert(sf.path);
         }
 
-        assert!(received.contains(&path1), "path1 not stabilised");
-        assert!(received.contains(&path2), "path2 not stabilised");
+        assert!(received.contains(&path1), "path1 did not stabilise");
+        assert!(received.contains(&path2), "path2 did not stabilise");
     }
 
     // ── Test 5: duplicate track submissions are idempotent ────────────────
 
-    /// Submitting the same path twice should produce exactly one StableFile.
+    /// Submitting the same path twice should produce exactly one [`StableFile`].
     #[tokio::test]
     async fn duplicate_track_produces_one_stable_event() {
         let mut tmp = NamedTempFile::new().unwrap();
@@ -596,18 +674,24 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let (out_tx, mut out_rx) = mpsc::channel::<StableFile>(4);
-        let mut tracker = fast_tracker();
+        let mut tracker = make_tracker();
         tracker.track(path.clone());
         tracker.track(path.clone()); // duplicate
         let _handle = tracker.run(out_tx);
 
-        // First event.
-        let result = timeout(Duration::from_secs(4), out_rx.recv()).await;
-        assert!(result.is_ok());
-        result.unwrap().expect("channel closed");
+        // First (and only) event.
+        let sf = timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("timed out waiting for first stable event")
+            .expect("output channel closed unexpectedly");
+        assert_eq!(sf.path, path);
 
-        // Second event should NOT arrive.
-        let second = timeout(Duration::from_millis(500), out_rx.recv()).await;
+        // A second event must NOT arrive within one extra stability window.
+        let second = timeout(
+            Duration::from_millis(STABILITY_MS + POLL_MS * 3),
+            out_rx.recv(),
+        )
+        .await;
         assert!(second.is_err(), "duplicate track produced a second stable event");
     }
 }

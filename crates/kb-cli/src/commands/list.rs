@@ -1,24 +1,139 @@
-//! `kb list [--status …] [--limit N]` — list tracked source files.
+//! `kb list [--status <status>] [--limit N]` — list tracked source files.
 //!
-//! Full implementation: T14.
+//! Displays a table of file rows from the state store, with optional filtering
+//! by status.  Columns are aligned to a fixed width so output is scannable at
+//! a glance.
+//!
+//! Operates in **offline mode**: opens the SQLite database directly so the
+//! command works whether or not the daemon is running.
+//!
+//! # Column widths
+//! ```text
+//!   ID  Status       Path                                  Hash           Updated
+//!  ──── ──────────── ───────────────────────────────────── ────────────── ───────────────────
+//!     1 done         ~/Vault/Sources/paper.pdf             sha256:ab12cd… 2026-05-23 10:30:01
+//!     2 queued       ~/Vault/Sources/data.xlsx             sha256:ff00aa… 2026-05-23 10:35:22
+//!     3 failed ◀     ~/Vault/Sources/broken.docx           —              2026-05-23 10:40:11
+//! ```
 
+use std::str::FromStr;
+
+use anyhow::{bail, Result};
 use clap::Args;
-use anyhow::Result;
+use kb_core::Status;
 
-#[derive(Args)]
+use super::db::{fmt_ts, open_store, short_hash, truncate_path};
+
+// ── Argument types ─────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
 pub struct ListArgs {
     /// Filter by status (seen, queued, processing, done, failed, skipped).
-    #[arg(long)]
+    #[arg(long, short = 's')]
     pub status: Option<String>,
 
-    /// Maximum number of rows to show (default: 50).
-    #[arg(long, default_value_t = 50)]
+    /// Maximum number of rows to show (default: 20).
+    #[arg(long, short = 'n', default_value_t = 20)]
     pub limit: usize,
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 pub async fn run(args: ListArgs) -> Result<()> {
-    // TODO (T14): query state store / HTTP API, format as table.
-    println!("kb list (status={:?}, limit={}) — not yet implemented (T14)",
-             args.status, args.limit);
+    // Validate the status filter before touching the DB.
+    let status_filter: Option<Status> = match &args.status {
+        Some(s) => {
+            let parsed = Status::from_str(s.as_str()).map_err(|_| {
+                anyhow::anyhow!(
+                    "unknown status '{s}'. \
+                     Valid values: seen, queued, processing, done, failed, skipped"
+                )
+            })?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    if args.limit == 0 {
+        bail!("--limit must be at least 1");
+    }
+
+    let store = open_store().await?;
+    let rows = store
+        .list_files(status_filter, args.limit as i64, 0)
+        .await?;
+
+    if rows.is_empty() {
+        match &args.status {
+            Some(s) => println!("No files with status '{s}'."),
+            None    => println!("No files tracked yet."),
+        }
+        return Ok(());
+    }
+
+    // ── Column widths (fixed so the table stays tidy) ─────────────────────────
+    const ID_W:     usize = 6;
+    const STATUS_W: usize = 12;
+    const PATH_W:   usize = 37;
+    const HASH_W:   usize = 14;
+    const TS_W:     usize = 19;
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    println!(
+        " {:>ID_W$}  {:<STATUS_W$}  {:<PATH_W$}  {:<HASH_W$}  {:<TS_W$}",
+        "ID", "Status", "Path", "Hash", "Updated",
+    );
+    println!(
+        " {}  {}  {}  {}  {}",
+        "─".repeat(ID_W),
+        "─".repeat(STATUS_W),
+        "─".repeat(PATH_W),
+        "─".repeat(HASH_W),
+        "─".repeat(TS_W),
+    );
+
+    // ── Rows ──────────────────────────────────────────────────────────────────
+    for row in &rows {
+        let status_str = row.status.as_str();
+
+        // Append a marker for attention-worthy statuses.
+        let status_display = match row.status {
+            Status::Failed     => format!("{status_str} ◀"),
+            Status::Processing => format!("{status_str} ●"),
+            _                  => status_str.to_string(),
+        };
+
+        let path_str = row.path.to_string_lossy();
+        let path_display = truncate_path(&path_str, PATH_W);
+
+        let hash_display = match &row.content_hash {
+            Some(h) => short_hash(h),
+            None    => "—".to_string(),
+        };
+
+        let ts_display = fmt_ts(row.updated_at);
+
+        println!(
+            " {:>ID_W$}  {:<STATUS_W$}  {:<PATH_W$}  {:<HASH_W$}  {:<TS_W$}",
+            row.id,
+            status_display,
+            path_display,
+            hash_display,
+            ts_display,
+        );
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────────
+    println!();
+    let shown = rows.len();
+    if shown == args.limit {
+        println!(
+            "  Showing {shown} rows (limit). Use --limit N to see more, \
+             or --status <status> to filter."
+        );
+    } else {
+        println!("  {shown} row(s) total.");
+    }
+
     Ok(())
 }

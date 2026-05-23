@@ -43,7 +43,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::migrations;
 use crate::types::{
-    AuditEvent, EnqueueOutcome, FileRow, OutputRecord, ProcessOutput, Stats, Status,
+    event_kind, AuditEvent, EnqueueOutcome, FileRow, OutputRecord, ProcessOutput, Stats, Status,
 };
 
 /// Bounded channel capacity — large enough to absorb a burst of concurrent
@@ -134,6 +134,19 @@ pub enum StateOp {
         kind:  Option<String>,
         limit: i64,
         reply: oneshot::Sender<crate::Result<Vec<AuditEvent>>>,
+    },
+
+    /// Atomic 5-rule dedup + enqueue for a freshly-stable file (§3.3).
+    ///
+    /// Combines `register_seen` + `set_hash` + `enqueue` in one transaction,
+    /// applying all dedup rules in the exact order specified by the plan.
+    ProcessStableFile {
+        path:         PathBuf,
+        size:         i64,
+        mtime_ns:     i64,
+        inode:        u64,
+        content_hash: String,
+        reply:        oneshot::Sender<crate::Result<EnqueueOutcome>>,
     },
 }
 
@@ -380,6 +393,55 @@ impl StateStore {
         })
         .await
     }
+
+    /// Atomically apply the §3.3 five-rule dedup + enqueue logic for a
+    /// freshly-stabilised file.
+    ///
+    /// This is the **primary entry point** for the watcher → state pipeline
+    /// (T13).  It replaces the three-step `register_seen` → `set_hash` →
+    /// `enqueue` sequence with a single, atomic SQLite transaction that
+    /// applies all dedup rules in strict order.
+    ///
+    /// # Rules (applied IN ORDER)
+    ///
+    /// 1. `path` is `done` **and** current hash matches stored hash
+    ///    → [`EnqueueOutcome::AlreadyDone`] (no DB change)
+    /// 2. `path` is `done` **but** hash differs
+    ///    → reset to `queued`, update metadata → [`EnqueueOutcome::RequeuedRevision`]
+    /// 3. Any **other** row with the same `content_hash` is `done`
+    ///    → mark this row `skipped` → [`EnqueueOutcome::SkippedDuplicate`]
+    /// 4. `path` is `queued` or `processing`
+    ///    → no-op → [`EnqueueOutcome::AlreadyPending`]
+    /// 5. Otherwise (new path, `seen`, `failed`, `skipped`)
+    ///    → transition to `queued` → [`EnqueueOutcome::Queued`]
+    ///
+    /// Audit events are recorded for `Queued`, `RequeuedRevision`, and
+    /// `SkippedDuplicate` outcomes inside the same transaction.
+    ///
+    /// # Arguments
+    /// - `path`         — canonical absolute path to the source file
+    /// - `size`         — file size in bytes (from the final stability stat)
+    /// - `mtime_ns`     — modification time in nanoseconds since Unix epoch
+    /// - `inode`        — macOS inode number
+    /// - `content_hash` — `"sha256:<hex>"` string produced by the hasher
+    pub async fn process_stable_file(
+        &self,
+        path:         PathBuf,
+        size:         i64,
+        mtime_ns:     i64,
+        inode:        u64,
+        content_hash: String,
+    ) -> crate::Result<EnqueueOutcome> {
+        self.send(|reply| StateOp::ProcessStableFile {
+            path,
+            size,
+            mtime_ns,
+            inode,
+            content_hash,
+            reply,
+        })
+        .await
+    }
 }
 
 // ─── StateActor ───────────────────────────────────────────────────────────────
@@ -459,6 +521,11 @@ impl StateActor {
             }
             StateOp::GetEvents { since, level, kind, limit, reply } => {
                 let _ = reply.send(self.get_events(since, level, kind, limit));
+            }
+            StateOp::ProcessStableFile { path, size, mtime_ns, inode, content_hash, reply } => {
+                let _ = reply.send(
+                    self.process_stable_file_op(path, size, mtime_ns, inode, content_hash),
+                );
             }
         }
     }
@@ -611,6 +678,186 @@ impl StateActor {
             rusqlite::params![now, id],
         )?;
         Ok(EnqueueOutcome::Queued)
+    }
+
+    /// Implements §3.3 dedup rules 1-5 atomically in a single transaction.
+    ///
+    /// All reads, writes, and the audit-event INSERT happen inside one
+    /// `BEGIN … COMMIT` so the caller always sees a fully-consistent state
+    /// transition — no partial updates are possible even under concurrent
+    /// callers (the actor serialises everything anyway, but the transaction
+    /// also provides durability on WAL flush).
+    ///
+    /// # Rule ordering
+    ///
+    /// ```text
+    /// 1. status=done  ∧  hash matches   → AlreadyDone      (no-op, implicit rollback)
+    /// 2. status=done  ∧  hash differs   → RequeuedRevision  (UPDATE + event)
+    /// 3. ∃ other row: hash=H ∧ done     → SkippedDuplicate  (UPDATE + event)
+    /// 4. status=queued|processing       → AlreadyPending    (no-op, implicit rollback)
+    /// 5. otherwise                      → Queued            (INSERT/UPDATE + event)
+    /// ```
+    ///
+    /// Rules 3 is checked **before** rule 4 per the specification.
+    fn process_stable_file_op(
+        &self,
+        path:         PathBuf,
+        size:         i64,
+        mtime_ns:     i64,
+        inode:        u64,
+        content_hash: String,
+    ) -> crate::Result<EnqueueOutcome> {
+        let path_str  = path.to_string_lossy().into_owned();
+        let now       = Self::now();
+        let inode_sql = inode as i64;
+
+        // All operations execute inside this transaction.  On any `?`-propagated
+        // error the transaction is automatically rolled back when `tx` is dropped.
+        let tx = self.conn.unchecked_transaction()?;
+
+        // ── 1. look up existing row by canonical path ─────────────────────────
+        let select_sql = format!("SELECT {} FROM files WHERE path = ?1", Self::FILE_COLS);
+        let existing: Option<FileRow> = match tx.query_row(
+            &select_sql,
+            rusqlite::params![&path_str],
+            |r| Self::map_file_row(r),
+        ) {
+            Ok(row)                                   => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e)                                    => return Err(e.into()),
+        };
+
+        // ── 2. apply dedup rules in order ─────────────────────────────────────
+        //
+        // `(file_id, outcome)` is set by whichever rule fires.
+        // Rules that leave the DB unchanged return early (tx dropped = no-op
+        // rollback — safe because no writes occurred).
+        let (file_id, outcome): (i64, EnqueueOutcome) = if let Some(row) = existing {
+            let fid = row.id;
+
+            // ── Rule 1: done + same hash ─────────────────────────────────────
+            if row.status == Status::Done
+                && row.content_hash.as_deref() == Some(content_hash.as_str())
+            {
+                // Nothing to do; tx rolls back silently.
+                return Ok(EnqueueOutcome::AlreadyDone);
+            }
+
+            // ── Rule 2: done + different hash ───────────────────────────────
+            if row.status == Status::Done {
+                tx.execute(
+                    "UPDATE files \
+                     SET content_hash = ?1, size = ?2, mtime_ns = ?3, inode = ?4, \
+                         status = 'queued', next_attempt_at = NULL, last_error = NULL, \
+                         updated_at = ?5 \
+                     WHERE id = ?6",
+                    rusqlite::params![&content_hash, size, mtime_ns, inode_sql, now, fid],
+                )?;
+                (fid, EnqueueOutcome::RequeuedRevision)
+            } else {
+                // ── Rule 3: another done row with same hash? (before rule 4) ─
+                let dup_done: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM files \
+                     WHERE content_hash = ?1 AND status = 'done' AND id != ?2",
+                    rusqlite::params![&content_hash, fid],
+                    |r| r.get(0),
+                )?;
+
+                if dup_done > 0 {
+                    tx.execute(
+                        "UPDATE files \
+                         SET content_hash = ?1, size = ?2, mtime_ns = ?3, inode = ?4, \
+                             status = 'skipped', updated_at = ?5 \
+                         WHERE id = ?6",
+                        rusqlite::params![&content_hash, size, mtime_ns, inode_sql, now, fid],
+                    )?;
+                    (fid, EnqueueOutcome::SkippedDuplicate)
+
+                } else if matches!(row.status, Status::Queued | Status::Processing) {
+                    // ── Rule 4: already in the pipeline ─────────────────────
+                    // Nothing to do; tx rolls back silently.
+                    return Ok(EnqueueOutcome::AlreadyPending);
+
+                } else {
+                    // ── Rule 5: seen / failed / skipped → queue ──────────────
+                    tx.execute(
+                        "UPDATE files \
+                         SET content_hash = ?1, size = ?2, mtime_ns = ?3, inode = ?4, \
+                             status = 'queued', next_attempt_at = NULL, last_error = NULL, \
+                             updated_at = ?5 \
+                         WHERE id = ?6",
+                        rusqlite::params![&content_hash, size, mtime_ns, inode_sql, now, fid],
+                    )?;
+                    (fid, EnqueueOutcome::Queued)
+                }
+            }
+        } else {
+            // ── New path: insert as 'seen', then apply rules 3 & 5 ──────────
+            tx.execute(
+                "INSERT INTO files \
+                 (path, content_hash, size, mtime_ns, inode, status, first_seen_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'seen', ?6, ?7)",
+                rusqlite::params![&path_str, &content_hash, size, mtime_ns, inode_sql, now, now],
+            )?;
+            let fid = tx.last_insert_rowid();
+
+            // ── Rule 3: another done row with same hash? ─────────────────────
+            let dup_done: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM files \
+                 WHERE content_hash = ?1 AND status = 'done' AND id != ?2",
+                rusqlite::params![&content_hash, fid],
+                |r| r.get(0),
+            )?;
+
+            if dup_done > 0 {
+                tx.execute(
+                    "UPDATE files SET status = 'skipped', updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, fid],
+                )?;
+                (fid, EnqueueOutcome::SkippedDuplicate)
+            } else {
+                // ── Rule 5: queue it ─────────────────────────────────────────
+                tx.execute(
+                    "UPDATE files SET status = 'queued', updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, fid],
+                )?;
+                (fid, EnqueueOutcome::Queued)
+            }
+        };
+
+        // ── 3. record an audit event for state-changing outcomes ───────────────
+        //
+        // AlreadyDone and AlreadyPending returned early above, so only
+        // Queued, RequeuedRevision, and SkippedDuplicate reach this point.
+        let (ev_kind, ev_msg): (&str, String) = match &outcome {
+            EnqueueOutcome::Queued => (
+                event_kind::QUEUED,
+                format!("queued: {path_str}"),
+            ),
+            EnqueueOutcome::RequeuedRevision => (
+                event_kind::QUEUED,
+                format!("requeued revision: {path_str}"),
+            ),
+            EnqueueOutcome::SkippedDuplicate => (
+                event_kind::SKIPPED_DUPLICATE,
+                format!("skipped duplicate: {path_str}"),
+            ),
+            // The remaining variants are unreachable here because they
+            // returned early before this point.  Guard them anyway so
+            // the match stays exhaustive without `#[allow(unreachable_patterns)]`.
+            EnqueueOutcome::AlreadyDone | EnqueueOutcome::AlreadyPending => {
+                unreachable!("AlreadyDone and AlreadyPending return early above")
+            }
+        };
+
+        tx.execute(
+            "INSERT INTO events (ts, level, kind, file_id, message, detail) \
+             VALUES (?1, 'info', ?2, ?3, ?4, NULL)",
+            rusqlite::params![now, ev_kind, file_id, &ev_msg],
+        )?;
+
+        tx.commit()?;
+        Ok(outcome)
     }
 
     fn claim_next(&self) -> crate::Result<Option<FileRow>> {

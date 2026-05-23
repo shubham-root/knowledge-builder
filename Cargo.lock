@@ -791,6 +791,7 @@ name = "kb-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dirs",
  "kb-core",
