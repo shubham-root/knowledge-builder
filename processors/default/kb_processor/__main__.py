@@ -17,6 +17,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -97,10 +98,10 @@ def main() -> NoReturn:
     )
 
     # ------------------------------------------------------------------
-    # 3. Run the pipeline.
+    # 3. Run the pipeline (async → run in a new event loop).
     # ------------------------------------------------------------------
     try:
-        result = pipeline.process(processor_input)
+        result = asyncio.run(pipeline.process(processor_input))
     except Exception as exc:
         logger.exception("Unhandled exception in pipeline.process")
         _emit(

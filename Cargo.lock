@@ -839,6 +839,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "globset",
  "kb-core",
  "kb-ops",
  "kb-watcher",

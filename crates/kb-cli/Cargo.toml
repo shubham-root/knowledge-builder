@@ -32,5 +32,8 @@ anyhow = { workspace = true }
 # Time formatting
 chrono = { workspace = true }
 
+# Glob pattern matching (used for building ignore-glob sets at daemon startup)
+globset = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
