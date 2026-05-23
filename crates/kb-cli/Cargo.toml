@@ -37,3 +37,6 @@ globset = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+# Terminal colors
+colored = { workspace = true }

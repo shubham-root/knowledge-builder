@@ -5,8 +5,10 @@
 //! mode); a future task will add HTTP-first fallback when the daemon is
 //! running.
 
-use anyhow::{Context, Result};
-use kb_core::{config::load_raw, StateStore};
+use std::path::PathBuf;
+
+use anyhow::{bail, Context, Result};
+use kb_core::{config::load_raw, FileRow, StateStore};
 
 /// Open the state DB and return a ready-to-use [`StateStore`].
 ///

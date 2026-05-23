@@ -239,6 +239,8 @@ pub mod event_kind {
     pub const CONFIG_LOADED:     &str = "config_loaded";
     pub const DAEMON_STARTED:    &str = "daemon_started";
     pub const DAEMON_STOPPING:   &str = "daemon_stopping";
+    pub const REQUEUED:          &str = "requeued";
+    pub const RESET:             &str = "reset";
 }
 
 // ── Processor contract types ──────────────────────────────────────────────────
@@ -391,6 +393,56 @@ pub enum EnqueueOutcome {
     /// This row was previously `done` but the content hash has changed;
     /// it has been re-`queued` as a new revision.
     RequeuedRevision,
+}
+
+// ── StorageStats ────────────────────────────────────────────────────────────────
+
+/// Per-extension aggregated statistics for source files (`kb storage`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtStat {
+    /// File extension (lowercase), e.g. `"pdf"`, `"docx"`.
+    pub ext: String,
+    /// Number of source files with this extension.
+    pub count: i64,
+    /// Total size in bytes of source files with this extension.
+    pub bytes: i64,
+}
+
+/// Per-kind aggregated statistics for output files (`kb storage`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KindStat {
+    /// Output kind string, e.g. `"markdown"`, `"asset"`.
+    pub kind: String,
+    /// Number of output files with this kind.
+    pub count: i64,
+    /// Total size in bytes of output files with this kind.
+    pub bytes: i64,
+}
+
+/// Aggregated storage statistics returned by `kb storage`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageStats {
+    /// Source file counts and sizes grouped by extension (sorted by bytes desc).
+    pub by_ext: Vec<ExtStat>,
+    /// Output file counts and sizes grouped by kind (sorted by bytes desc).
+    pub by_kind: Vec<KindStat>,
+    /// Total number of source file rows tracked in the `files` table.
+    pub total_source_count: i64,
+    /// Total number of output rows tracked in the `outputs` table.
+    pub total_output_count: i64,
+    /// Sum of all source bytes + all output bytes.
+    pub total_bytes: i64,
+}
+
+/// Result of a `kb prune` operation (or its `--dry-run` preview).
+#[derive(Debug, Clone, Default)]
+pub struct PruneResult {
+    /// Number of file records that were (or would be) deleted.
+    pub file_count: usize,
+    /// Number of output records that were (or would be) deleted (via cascade).
+    pub output_count: usize,
+    /// In dry-run mode: the file rows that would be pruned.  Empty otherwise.
+    pub files: Vec<FileRow>,
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────

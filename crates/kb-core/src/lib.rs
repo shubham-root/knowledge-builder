@@ -53,6 +53,12 @@ pub use types::{
     // Aggregate stats
     Stats,
 
+    // Storage / prune types
+    ExtStat,
+    KindStat,
+    StorageStats,
+    PruneResult,
+
     // Well-known event kind string constants
     event_kind,
 };

@@ -21,10 +21,33 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Install the vision extra to enable LLM-based image description (T37).
+# Install the vision extra to enable LLM-based image description (T37)
+# AND the OpenAI-backed LLM synthesis pipeline.
 # Usage: pip install -e "processors/default[vision]"
 vision = [
     "openai>=1.30.0",
+]
+
+# Install the llm extra for litellm support (handles OpenAI, Anthropic,
+# AWS Bedrock, and many other providers through a single interface).
+# Usage: pip install -e "processors/default[llm]"
+llm = [
+    "litellm>=1.0.0",
+]
+
+# Install the anthropic extra for direct Anthropic / Claude support.
+# Also works via litellm when the [llm] extra is installed.
+# Usage: pip install -e "processors/default[anthropic]"
+anthropic = [
+    "anthropic>=0.25.0",
+]
+
+# Install everything at once for full functionality.
+# Usage: pip install -e "processors/default[all]"
+all = [
+    "openai>=1.30.0",
+    "litellm>=1.0.0",
+    "anthropic>=0.25.0",
 ]
 
 [project.scripts]

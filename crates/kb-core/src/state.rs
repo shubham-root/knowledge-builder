@@ -43,7 +43,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::migrations;
 use crate::types::{
-    event_kind, AuditEvent, EnqueueOutcome, FileRow, OutputRecord, ProcessOutput, Stats, Status,
+    event_kind, AuditEvent, EnqueueOutcome, FileRow, KindStat, ExtStat,
+    OutputRecord, ProcessOutput, PruneResult, Stats, StorageStats, Status,
 };
 
 /// Bounded channel capacity — large enough to absorb a burst of concurrent
@@ -141,6 +142,31 @@ pub enum StateOp {
         reply: oneshot::Sender<crate::Result<Vec<AuditEvent>>>,
     },
 
+    /// Manually requeue a file: reset status → `queued`, attempts → 0,
+    /// clear `last_error` and `next_attempt_at`, record a `requeued` event.
+    ///
+    /// Returns the **old** `Status` of the row so callers can report
+    /// "was: <old_status>" confirmation messages.
+    Requeue {
+        id:    i64,
+        reply: oneshot::Sender<crate::Result<Status>>,
+    },
+
+    /// Hard-delete a file row and all its associated output records, then
+    /// record a `reset` audit event.
+    ///
+    /// The FK `ON DELETE CASCADE` in the `outputs` table removes output rows
+    /// automatically. The `events` FK uses `ON DELETE SET NULL`, so prior
+    /// audit events for the file are retained with `file_id = NULL`.
+    ///
+    /// Returns `(path, output_count)` so the caller can display a confirmation.
+    ///
+    /// Does **not** delete physical output files from disk.
+    ResetFile {
+        id:    i64,
+        reply: oneshot::Sender<crate::Result<(PathBuf, usize)>>,
+    },
+
     /// Atomic 5-rule dedup + enqueue for a freshly-stable file (§3.3).
     ///
     /// Combines `register_seen` + `set_hash` + `enqueue` in one transaction,
@@ -152,6 +178,24 @@ pub enum StateOp {
         inode:        u64,
         content_hash: String,
         reply:        oneshot::Sender<crate::Result<EnqueueOutcome>>,
+    },
+
+    /// Prune file rows (and their cascading outputs) that match a status +
+    /// optional date filter.  In dry-run mode the rows are returned but not
+    /// deleted.
+    PruneFiles {
+        /// Only rows with `updated_at < before_ts` (None = no cutoff).
+        before_ts: Option<i64>,
+        /// Only rows whose `status` equals this value.
+        status:    Status,
+        /// When `true`, compute counts and collect rows but make no changes.
+        dry_run:   bool,
+        reply:     oneshot::Sender<crate::Result<PruneResult>>,
+    },
+
+    /// Compute storage usage aggregates for `kb storage`.
+    GetStorageStats {
+        reply: oneshot::Sender<crate::Result<StorageStats>>,
     },
 }
 
@@ -482,6 +526,39 @@ impl StateStore {
         })
         .await
     }
+
+    /// Manually requeue a file: reset status → `queued`, attempts → 0,
+    /// clear `last_error` and `next_attempt_at`, and record a `requeued` audit
+    /// event.
+    ///
+    /// Works in offline mode (direct DB access) so it can be used from the
+    /// CLI whether or not the daemon is running.
+    ///
+    /// # Returns
+    /// The **previous** [`Status`] of the file so callers can display
+    /// `"Requeued: <path> (was: <old_status>)"` confirmation messages.
+    ///
+    /// # Errors
+    /// Returns an error if no file with `id` exists.
+    pub async fn requeue(&self, id: i64) -> crate::Result<Status> {
+        self.send(|reply| StateOp::Requeue { id, reply }).await
+    }
+
+    /// Hard-delete a file row and all its associated output records from the DB.
+    ///
+    /// Does **not** remove actual output files from disk — only DB records are
+    /// affected.  The file will be re-discovered and re-queued on the next
+    /// periodic scan or watcher event.
+    ///
+    /// # Returns
+    /// A tuple `(path, output_count)` where `output_count` is the number of
+    /// output rows that were cascade-deleted alongside the source row.
+    ///
+    /// # Errors
+    /// Returns an error if no file with `id` exists.
+    pub async fn reset_file(&self, id: i64) -> crate::Result<(PathBuf, usize)> {
+        self.send(|reply| StateOp::ResetFile { id, reply }).await
+    }
 }
 
 // ─── StateActor ───────────────────────────────────────────────────────────────
@@ -561,6 +638,12 @@ impl StateActor {
             }
             StateOp::GetEvents { since, level, kind, limit, reply } => {
                 let _ = reply.send(self.get_events(since, level, kind, limit));
+            }
+            StateOp::Requeue { id, reply } => {
+                let _ = reply.send(self.requeue_op(id));
+            }
+            StateOp::ResetFile { id, reply } => {
+                let _ = reply.send(self.reset_file_op(id));
             }
             StateOp::ProcessStableFile { path, size, mtime_ns, inode, content_hash, reply } => {
                 let _ = reply.send(
@@ -718,6 +801,133 @@ impl StateActor {
             rusqlite::params![now, id],
         )?;
         Ok(EnqueueOutcome::Queued)
+    }
+
+    // ─── requeue / reset ─────────────────────────────────────────────────────
+
+    /// Reset a file row to `queued` status with a clean slate.
+    ///
+    /// Sets `status = 'queued'`, `attempts = 0`, `last_error = NULL`,
+    /// `next_attempt_at = NULL`, and bumps `updated_at`.
+    /// Records a `requeued` audit event.
+    ///
+    /// Returns the **previous** `Status` for the confirmation message.
+    fn requeue_op(&self, id: i64) -> crate::Result<Status> {
+        let now = Self::now();
+
+        // Fetch the current row so we can (a) verify it exists and (b) return
+        // the old status for the caller's confirmation message.
+        let sql = format!("SELECT {} FROM files WHERE id = ?1", Self::FILE_COLS);
+        let row = match self.conn.query_row(&sql, [id], |r| Self::map_file_row(r)) {
+            Ok(r)                                         => r,
+            Err(rusqlite::Error::QueryReturnedNoRows)     =>
+                return Err(anyhow::anyhow!("no file found with ID {id}")),
+            Err(e) => return Err(e.into()),
+        };
+
+        let old_status = row.status.clone();
+        let path_str   = row.path.to_string_lossy().into_owned();
+
+        // Reset to queued — always overwrite regardless of current status so
+        // the operator can force even a `processing` row back into the queue.
+        self.conn.execute(
+            "UPDATE files \
+             SET status = 'queued', attempts = 0, \
+                 last_error = NULL, next_attempt_at = NULL, \
+                 updated_at = ?1 \
+             WHERE id = ?2",
+            rusqlite::params![now, id],
+        )?;
+
+        // Audit trail.
+        self.record_event_op(
+            "info",
+            event_kind::REQUEUED,
+            Some(id),
+            &format!("requeued (was {old_status}): {path_str}"),
+            None,
+        )?;
+
+        tracing::info!(
+            file_id = id,
+            old_status = old_status.as_str(),
+            "Requeued file: {path_str}",
+        );
+
+        Ok(old_status)
+    }
+
+    /// Hard-delete a file row (and its cascade-deleted outputs) from the DB.
+    ///
+    /// Records a `reset` audit event **before** deleting the row, so the
+    /// event log retains a record of the operation even though the file row
+    /// is gone.  The event's `file_id` is set to `NULL` automatically by the
+    /// FK `ON DELETE SET NULL` trigger on the `events` table.
+    ///
+    /// Returns `(path, output_count)` for the caller's confirmation message.
+    fn reset_file_op(&self, id: i64) -> crate::Result<(PathBuf, usize)> {
+        let now = Self::now();
+
+        // Fetch the current row.
+        let sql = format!("SELECT {} FROM files WHERE id = ?1", Self::FILE_COLS);
+        let row = match self.conn.query_row(&sql, [id], |r| Self::map_file_row(r)) {
+            Ok(r)                                         => r,
+            Err(rusqlite::Error::QueryReturnedNoRows)     =>
+                return Err(anyhow::anyhow!("no file found with ID {id}")),
+            Err(e) => return Err(e.into()),
+        };
+
+        let path      = row.path.clone();
+        let path_str  = path.to_string_lossy().into_owned();
+
+        // Count outputs that will be cascade-deleted.
+        let output_count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM outputs WHERE source_id = ?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+
+        // Record the audit event BEFORE deleting so `file_id` is still valid
+        // at insert time (FK constraint).  The FK `ON DELETE SET NULL` will
+        // NULL it out when the file row is removed.
+        self.record_event_op(
+            "info",
+            event_kind::RESET,
+            Some(id),
+            &format!(
+                "reset: {} ({output_count} output(s) removed)",
+                path_str
+            ),
+            None,
+        )?;
+
+        // Insert a second event with no file_id so there is a permanent record
+        // even after the FK sets the first event's file_id to NULL.
+        self.conn.execute(
+            "INSERT INTO events (ts, level, kind, file_id, message, detail) \
+             VALUES (?1, 'info', ?2, NULL, ?3, NULL)",
+            rusqlite::params![
+                now,
+                event_kind::RESET,
+                format!("reset (permanent record — file row deleted): {path_str}"),
+            ],
+        )?;
+
+        // Delete the file row.  The `outputs` FK (`ON DELETE CASCADE`) removes
+        // all associated output rows automatically.  The `events` FK
+        // (`ON DELETE SET NULL`) keeps event rows but nullifies their file_id.
+        self.conn.execute(
+            "DELETE FROM files WHERE id = ?1",
+            [id],
+        )?;
+
+        tracing::info!(
+            file_id       = id,
+            output_count  = output_count,
+            "Reset file: {path_str}",
+        );
+
+        Ok((path, output_count))
     }
 
     /// Implements §3.3 dedup rules 1-5 atomically in a single transaction.
