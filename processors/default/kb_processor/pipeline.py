@@ -52,7 +52,7 @@ import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .extractors.base import ExtractionError, ExtractionResult
 from .extractors.docx import DocxExtractor
@@ -516,7 +516,10 @@ def _call_anthropic(
 # ---------------------------------------------------------------------------
 
 
-async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultError:
+async def process(
+    inp: ProcessorInput,
+    progress: "Callable[[str], None] | None" = None,
+) -> "ProcessorResultOk | ProcessorResultError":
     """Run the full extract → synthesize → write pipeline for *inp*.
 
     Never raises — all errors are captured and returned as
@@ -526,6 +529,11 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
     ----------
     inp:
         Processor input received from the Rust daemon (JSON-on-stdin).
+    progress:
+        Optional callable that receives a progress-step label string.  The
+        entry point (``__main__``) passes a function that prints
+        ``[kb-processor] <label>`` to stdout so operators can monitor long
+        jobs.  Defaults to ``None`` (no-op).
 
     Returns
     -------
@@ -533,6 +541,12 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
         On success: all output paths, byte counts, model, token usage.
         On failure: human-readable error, retryable flag, pipeline step.
     """
+    def _report(label: str) -> None:
+        if progress is not None:
+            try:
+                progress(label)
+            except Exception:  # noqa: BLE001
+                pass  # never let a progress callback crash the pipeline
     input_path: Path = inp.input_path
     vault_root: Path = inp.vault_root
     sources_dir: Path = inp.sources_dir
@@ -565,6 +579,7 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
     logger.info("Using %s for %s", extractor_name, input_path.name)
 
     # ── b. EXTRACT ────────────────────────────────────────────────────── #
+    _report("Step 1/4: Extracting content...")
     logger.info("EXTRACT — calling %s.extract()", extractor_name)
     try:
         extracted: ExtractionResult = await asyncio.to_thread(
@@ -598,6 +613,7 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
     )
 
     # ── c. SYNTHESIZE ─────────────────────────────────────────────────── #
+    _report("Step 2/4: Synthesizing with LLM...")
     model: str = os.environ.get("KB_LLM_MODEL", _DEFAULT_LLM_MODEL)
     image_filenames: list[str] = [img.name for img in extracted.images]
 
@@ -671,6 +687,7 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
     )
 
     # ── e. WRITE ──────────────────────────────────────────────────────── #
+    _report("Step 3/4: Writing outputs...")
     logger.info("WRITE — staging %d output(s)", 1 + len(extracted.images))
 
     writer = AtomicWriter(
@@ -722,6 +739,7 @@ async def process(inp: ProcessorInput) -> ProcessorResultOk | ProcessorResultErr
         )
 
     # ── f. RETURN ─────────────────────────────────────────────────────── #
+    _report("Step 4/4: Validating...")
     outputs: list[OutputEntry] = [
         OutputEntry(path=rec.path, kind=rec.kind, bytes=rec.bytes)
         for rec in records
