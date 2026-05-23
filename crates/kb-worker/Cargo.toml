@@ -9,6 +9,7 @@ kb-core = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Serialization
 serde      = { workspace = true }

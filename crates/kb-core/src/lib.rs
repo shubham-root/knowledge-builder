@@ -14,6 +14,7 @@
 //! All other crates depend on this one; keep the public API stable.
 
 pub mod config;
+pub mod lock;
 pub mod logging;
 pub mod migrations;
 pub mod paths;
@@ -22,6 +23,9 @@ pub mod tracing_setup;
 pub mod types;
 
 // ── Crate-level re-exports ────────────────────────────────────────────────────
+
+// Lock
+pub use lock::{DaemonLock, LockError};
 
 // Logging
 pub use logging::{init_logging, LogGuard};
