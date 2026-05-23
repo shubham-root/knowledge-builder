@@ -476,9 +476,11 @@ proptest! {
                 Status::Skipped,
             ];
             let mut id_to_status: HashMap<i64, Status> = HashMap::new();
-            for &status in &statuses {
-                for row in files_with(&store, status).await {
-                    if let Some(prev) = id_to_status.insert(row.id, status) {
+            for status in statuses {
+                // Clone for the query; keep `status` for the HashMap insert.
+                let rows = files_with(&store, status.clone()).await;
+                for row in rows {
+                    if let Some(prev) = id_to_status.insert(row.id, status.clone()) {
                         panic!(
                             "file {} appeared in both {:?} and {:?} — \
                              single-status invariant violated",
@@ -819,7 +821,7 @@ proptest! {
                         }
                     }
                     1 /* Done */ => {
-                        if let Some(&id) = in_flight.first() {
+                        if !in_flight.is_empty() {
                             let id = in_flight.remove(0);
                             store
                                 .mark_done(id, vec![], None)
@@ -829,7 +831,7 @@ proptest! {
                         }
                     }
                     2 /* Fail */ => {
-                        if let Some(&id) = in_flight.first() {
+                        if !in_flight.is_empty() {
                             let id = in_flight.remove(0);
                             store
                                 .mark_failed(id, "transition-test".to_owned(), false)
@@ -842,14 +844,14 @@ proptest! {
                 }
 
                 // ── Reconcile oracle with actual DB ───────────────────────
-                for (&id, &expected) in &oracle {
+                for (&id, expected) in &oracle {
                     if let Some(row) = store
                         .get_file_by_id(id)
                         .await
                         .expect("get_file_by_id")
                     {
                         assert_eq!(
-                            row.status, expected,
+                            row.status, *expected,
                             "oracle mismatch for file {id}: expected {:?} \
                              but DB has {:?}",
                             expected, row.status
