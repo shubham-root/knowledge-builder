@@ -1,0 +1,35 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate exists solely to host the integration test suite.
+# It has no library source; all code lives in the `tests/` subdirectory.
+
+[[test]]
+name        = "integration"
+path        = "tests/integration.rs"
+harness     = true
+
+[dev-dependencies]
+# Async runtime
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+
+# Serialization
+serde_json  = { workspace = true }
+
+# Error handling
+anyhow      = { workspace = true }
+
+# Test utilities
+tempfile    = { workspace = true }
+
+# Glob matching (needed to build a GlobSet for scan_once)
+globset     = { workspace = true }
+
+# Internal crates
+kb-core     = { workspace = true }
+kb-watcher  = { workspace = true }
+kb-worker   = { workspace = true }

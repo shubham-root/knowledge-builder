@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -64,6 +64,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/events", get(get_events))
         // ── SSE tail ──────────────────────────────────────────────────────────
         .route("/tail", get(tail_sse_handler))
+        // ── Prometheus metrics ───────────────────────────────────────────────
+        .route("/metrics", get(metrics_handler))
         // ── Shared state ─────────────────────────────────────────────────────
         .with_state(state)
 }
@@ -488,6 +490,56 @@ async fn tail_sse_handler(
     crate::events::tail_sse(state, headers, query).await
 }
 
+// ── /metrics ────────────────────────────────────────────────────────────────
+
+/// `GET /metrics` — Prometheus text-format metrics exposition.
+///
+/// Returns all registered metrics in the
+/// [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/).
+///
+/// The gauge metrics (`kb_queue_depth`, `kb_in_flight`) are refreshed from
+/// the live state store on every request so they always reflect the current
+/// queue state.
+///
+/// Returns `503 Service Unavailable` when the Prometheus recorder was not
+/// initialised (e.g. when running in test mode with `metrics_handle: None`).
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+    // ── Refresh point-in-time gauges from the DB ─────────────────────────
+    //
+    // Gauges for queue_depth and in_flight are derived from the live DB state
+    // rather than maintained incrementally, because the DB is the source of
+    // truth for these counts.  Updating them here (at scrape time) gives
+    // accurate point-in-time values without the complexity of instrumenting
+    // every state transition.
+    match state.state_store.stats().await {
+        Ok(stats) => {
+            metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(stats.queued as f64);
+            metrics::gauge!(crate::metrics::IN_FLIGHT).set(stats.processing as f64);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics: failed to refresh gauge values from state store");
+        }
+    }
+
+    // ── Render and respond ──────────────────────────────────────────────────
+    match &state.metrics_handle {
+        Some(handle) => {
+            let body = handle.render();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Metrics collector not initialized",
+        )
+            .into_response(),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -515,6 +567,7 @@ mod tests {
             start_time: Instant::now(),
             scanner_trigger: None,
             event_broadcaster: broadcaster,
+            metrics_handle: None,
         })
     }
 
@@ -556,6 +609,7 @@ mod tests {
             start_time: Instant::now() - std::time::Duration::from_secs(10),
             scanner_trigger: None,
             event_broadcaster: crate::EventBroadcaster::new(256),
+            metrics_handle: None,
         });
         let app = router(state);
 
@@ -816,6 +870,7 @@ mod tests {
             start_time: Instant::now(),
             scanner_trigger: Some(tx),
             event_broadcaster: crate::EventBroadcaster::new(256),
+            metrics_handle: None,
         });
         let app = router(state);
 
@@ -1073,5 +1128,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /metrics ──────────────────────────────────────────────────────────────────
+
+    /// Without a metrics handle the endpoint returns 503.
+    #[tokio::test]
+    async fn metrics_without_handle_returns_503() {
+        let state = test_state().await; // metrics_handle = None
+        let app = router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

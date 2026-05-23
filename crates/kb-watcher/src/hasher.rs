@@ -81,13 +81,17 @@ pub async fn hash_file(path: &Path, chunk_bytes: usize) -> Result<String, HashEr
     // Capture an owned copy of the path so we can move it into the closure.
     let path_buf = path.to_path_buf();
 
-    tokio::task::spawn_blocking(move || hash_file_blocking(&path_buf, chunk_bytes))
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || hash_file_blocking(&path_buf, chunk_bytes))
         .await
         // JoinError → treat as an IoError with a synthetic error
         .map_err(|e| HashError::IoError {
             path:   path.to_path_buf(),
             source: io::Error::new(io::ErrorKind::Other, e.to_string()),
-        })?
+        })?;
+    // Record hash duration regardless of success/failure.
+    metrics::histogram!("kb_hash_duration_seconds").record(start.elapsed().as_secs_f64());
+    result
 }
 
 // ── Blocking worker (called inside spawn_blocking) ────────────────────────────

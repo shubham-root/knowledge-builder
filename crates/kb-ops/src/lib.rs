@@ -26,6 +26,7 @@
 //!     start_time: Instant::now(),
 //!     scanner_trigger: None,
 //!     event_broadcaster: broadcaster,
+//!     metrics_handle: None,
 //! };
 //! let shutdown = CancellationToken::new();
 //! let _handle = start_server("127.0.0.1:7878", state, shutdown).await?;
@@ -37,6 +38,7 @@
 
 pub mod api;
 pub mod events;
+pub mod metrics;
 pub mod sse;
 
 use std::sync::Arc;
@@ -51,6 +53,7 @@ use tower_http::trace::TraceLayer;
 use kb_core::StateStore;
 
 pub use events::EventBroadcaster;
+pub use metrics::PrometheusHandle;
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -86,6 +89,12 @@ pub struct AppState {
     /// [`AuditEvent`]: kb_core::AuditEvent
     /// [`StateStore::record_event`]: kb_core::StateStore::record_event
     pub event_broadcaster: EventBroadcaster,
+
+    /// Prometheus metrics handle for rendering `GET /metrics`.
+    ///
+    /// `None` in unit tests (no global recorder installed).  In the live
+    /// daemon, set by calling [`metrics::init_metrics`] at startup.
+    pub metrics_handle: Option<PrometheusHandle>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -94,6 +103,7 @@ impl std::fmt::Debug for AppState {
             .field("start_time", &self.start_time)
             .field("scanner_trigger", &self.scanner_trigger.as_ref().map(|_| "<Sender<()>>"))
             .field("event_broadcaster", &self.event_broadcaster)
+            .field("metrics_handle", &self.metrics_handle.as_ref().map(|_| "<PrometheusHandle>"))
             .finish_non_exhaustive()
     }
 }

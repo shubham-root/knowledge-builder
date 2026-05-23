@@ -6,6 +6,7 @@ members = [
     "crates/kb-worker",
     "crates/kb-ops",
     "crates/kb-cli",
+    "tests/integration",
 ]
 
 # ── Shared dependency versions ────────────────────────────────────────────────
@@ -68,6 +69,13 @@ colored          = { version = "2" }
 
 # Async stream utilities (used by kb-ops SSE)
 futures-util     = { version = "0.3", default-features = false, features = ["std"] }
+
+# HTTP client (used by kb-cli for daemon fallback)
+reqwest          = { version = "0.12", features = ["json", "stream"] }
+
+# Metrics
+metrics                    = { version = "0.23" }
+metrics-exporter-prometheus = { version = "0.15" }
 
 # Testing utilities
 tempfile   = { version = "3" }

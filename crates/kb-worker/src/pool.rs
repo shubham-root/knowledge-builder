@@ -48,6 +48,13 @@ use crate::{
     validate::validate_processor_outputs,
 };
 
+// Metric names (same constants as kb_ops::metrics — duplicated here so
+// kb-worker does not need to depend on kb-ops, keeping the dependency graph
+// acyclic: kb-ops → kb-worker, NOT kb-worker → kb-ops).
+const METRIC_PROCESSED_TOTAL: &str = "kb_processed_total";
+const METRIC_FAILED_TOTAL: &str = "kb_failed_total";
+const METRIC_PROCESSOR_DURATION: &str = "kb_processor_duration_seconds";
+
 // ── process_job ───────────────────────────────────────────────────────────────
 
 /// Process a single claimed job end-to-end.
@@ -179,6 +186,7 @@ pub async fn process_job(
     //   • enforcing `timeout_secs` with SIGTERM → (5 s grace) → SIGKILL,
     //   • capturing stdout line-by-line,
     //   • parsing the last non-empty stdout line as a `ProcessResult`.
+    let processor_start = std::time::Instant::now();
     let invoke_result = invoke_processor(
         &config.command,
         &input,
@@ -186,6 +194,9 @@ pub async fn process_job(
         config.timeout_secs,
     )
     .await;
+    let processor_elapsed = processor_start.elapsed().as_secs_f64();
+    // Record processor wall-clock time regardless of outcome.
+    metrics::histogram!(METRIC_PROCESSOR_DURATION).record(processor_elapsed);
 
     // ── (e–g) Handle the outcome ──────────────────────────────────────────
     let job_succeeded: bool = match invoke_result {
@@ -217,6 +228,7 @@ pub async fn process_job(
                                         outputs_count = outputs_count,
                                         "job completed successfully",
                                     );
+                                    metrics::counter!(METRIC_PROCESSED_TOTAL).increment(1);
                                     true
                                 }
                                 Err(e) => {
@@ -232,6 +244,7 @@ pub async fn process_job(
                                     let _ = state
                                         .mark_failed(job.id, e.to_string(), true)
                                         .await;
+                                    metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
                                     false
                                 }
                             }
@@ -253,6 +266,7 @@ pub async fn process_job(
                                     false, // non-retryable
                                 )
                                 .await;
+                            metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
                             false
                         }
                     }
@@ -267,6 +281,7 @@ pub async fn process_job(
                         "processor reported error result",
                     );
                     let _ = state.mark_failed(job.id, error, retryable).await;
+                    metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
                     false
                 }
             }
@@ -286,6 +301,7 @@ pub async fn process_job(
                     true,
                 )
                 .await;
+            metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
             false
         }
 
@@ -297,6 +313,7 @@ pub async fn process_job(
                 "processor invocation error — marking failed (retryable)",
             );
             let _ = state.mark_failed(job.id, e.to_string(), true).await;
+            metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
             false
         }
     };

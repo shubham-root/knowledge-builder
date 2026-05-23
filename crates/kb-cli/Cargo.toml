@@ -21,6 +21,7 @@ clap = { workspace = true }
 tokio = { workspace = true }
 
 # Serialization
+serde      = { workspace = true }
 serde_json = { workspace = true }
 
 # Platform helpers (config path)
@@ -46,3 +47,9 @@ rusqlite = { workspace = true }
 
 # UID lookup (install/uninstall)
 libc = { workspace = true }
+
+# HTTP client (daemon fallback when daemon is running)
+reqwest      = { workspace = true }
+
+# Async stream utilities (SSE tail stream)
+futures-util = { workspace = true }

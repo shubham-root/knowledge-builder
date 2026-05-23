@@ -4,9 +4,8 @@
 //! queue depth, age of the oldest pending entry, and the most recent error
 //! message if any file is in a failed state.
 //!
-//! Operates in **offline mode**: opens the SQLite database directly (via the
-//! config's `db_path`), so the command works whether or not the daemon is
-//! currently running.
+//! **HTTP-first:** When the daemon is running, statistics are fetched live via
+//! `GET /stats`.  When offline the SQLite database is read directly.
 //!
 //! # Example output
 //! ```text
@@ -29,15 +28,75 @@
 //!  Last error:       processor timed out after 1800s
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use kb_core::config::load_raw;
 
+use crate::client::DaemonClient;
 use super::db::{fmt_age, open_store};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run() -> Result<()> {
-    let store = open_store().await?;
-    let stats = store.stats().await?;
+    let config = load_raw().context("failed to load configuration")?;
+
+    if let Some(client) = DaemonClient::try_connect(&config.ops.http_bind).await {
+        // ── HTTP mode (daemon is running) ─────────────────────────────────────
+        let stats = client.get_stats().await?;
+        print_stats(
+            stats.count("seen"),
+            stats.count("queued"),
+            stats.count("processing"),
+            stats.count("done"),
+            stats.count("failed"),
+            stats.count("skipped"),
+            stats.queue_depth,
+            stats.oldest_pending_age_secs,
+            stats.last_error.as_deref(),
+        );
+    } else {
+        // ── DB mode (daemon not running — direct SQLite access) ───────────────
+        let store = open_store().await?;
+        let stats = store.stats().await?;
+        print_stats(
+            stats.seen,
+            stats.queued,
+            stats.processing,
+            stats.done,
+            stats.failed,
+            stats.skipped,
+            stats.queue_depth,
+            stats.oldest_pending_age_secs,
+            stats.last_error.as_deref(),
+        );
+    }
+
+    Ok(())
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+/// Render the status table.  Called from both HTTP and DB code paths with the
+/// same extracted values so the output is identical regardless of source.
+fn print_stats(
+    seen:       i64,
+    queued:     i64,
+    processing: i64,
+    done:       i64,
+    failed:     i64,
+    skipped:    i64,
+    queue_depth:             i64,
+    oldest_pending_age_secs: Option<i64>,
+    last_error:              Option<&str>,
+) {
+    let rows: &[(&str, i64)] = &[
+        ("seen",       seen),
+        ("queued",     queued),
+        ("processing", processing),
+        ("done",       done),
+        ("failed",     failed),
+        ("skipped",    skipped),
+    ];
+    let total: i64 = rows.iter().map(|(_, c)| c).sum();
 
     // ── Header ────────────────────────────────────────────────────────────────
     println!("Knowledge Builder — Queue Status");
@@ -45,17 +104,6 @@ pub async fn run() -> Result<()> {
     println!();
 
     // ── Status breakdown table ────────────────────────────────────────────────
-    let rows: &[(&str, i64)] = &[
-        ("seen",       stats.seen),
-        ("queued",     stats.queued),
-        ("processing", stats.processing),
-        ("done",       stats.done),
-        ("failed",     stats.failed),
-        ("skipped",    stats.skipped),
-    ];
-
-    let total: i64 = rows.iter().map(|(_, c)| c).sum();
-
     const STATUS_W: usize = 11;
     const COUNT_W:  usize = 7;
 
@@ -63,16 +111,12 @@ pub async fn run() -> Result<()> {
     println!("  {}  {}", "─".repeat(STATUS_W), "─".repeat(COUNT_W));
 
     for (name, count) in rows {
-        // Highlight non-zero entries for `failed` and `processing`.
         let marker = if (*name == "failed" || *name == "processing") && *count > 0 {
             " ◀"
         } else {
             ""
         };
-        println!(
-            "  {:<STATUS_W$}  {:>COUNT_W$}{marker}",
-            name, count,
-        );
+        println!("  {:<STATUS_W$}  {:>COUNT_W$}{marker}", name, count);
     }
 
     println!("  {}  {}", "─".repeat(STATUS_W), "─".repeat(COUNT_W));
@@ -80,20 +124,19 @@ pub async fn run() -> Result<()> {
     println!();
 
     // ── Derived metrics ───────────────────────────────────────────────────────
-    println!("  Queue depth:      {}", stats.queue_depth);
+    println!("  Queue depth:      {queue_depth}");
 
-    match stats.oldest_pending_age_secs {
+    match oldest_pending_age_secs {
         Some(age) => println!("  Oldest pending:   {}", fmt_age(age)),
         None      => println!("  Oldest pending:   —"),
     }
 
-    match &stats.last_error {
+    match last_error {
         Some(err) => {
-            // Truncate very long error strings so they don't wrap badly.
             let display = if err.len() > 80 {
                 format!("{}…", &err[..77])
             } else {
-                err.clone()
+                err.to_string()
             };
             println!("  Last error:       {display}");
         }
@@ -101,5 +144,4 @@ pub async fn run() -> Result<()> {
     }
 
     println!();
-    Ok(())
 }

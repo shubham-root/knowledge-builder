@@ -303,6 +303,7 @@ async fn run_one_scan(
 
     info!(sources_dir = %sources_dir.display(), "periodic scanner: starting scan");
 
+    let scan_instant = std::time::Instant::now();
     let candidate_count = match scan_once(sources_dir, extensions, ignore_globs, state, path_sender).await {
         Ok(n) => n,
         Err(e) => {
@@ -310,6 +311,8 @@ async fn run_one_scan(
             0
         }
     };
+    // Record scan duration (wall-clock seconds, sub-second precision).
+    metrics::histogram!("kb_scan_duration_seconds").record(scan_instant.elapsed().as_secs_f64());
 
     let elapsed_secs = unix_now().saturating_sub(scan_start);
 

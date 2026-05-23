@@ -26,6 +26,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod client;
 mod commands;
 
 #[derive(Parser)]

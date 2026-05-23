@@ -22,6 +22,9 @@ anyhow    = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Metrics
+metrics = { workspace = true }
+
 # Unix signal constants (SIGTERM, SIGKILL, killpg)
 libc = { workspace = true }
 

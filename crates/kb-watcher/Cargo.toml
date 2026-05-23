@@ -32,5 +32,8 @@ anyhow    = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Metrics
+metrics = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

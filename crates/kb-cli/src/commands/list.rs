@@ -1,11 +1,9 @@
 //! `kb list [--status <status>] [--limit N]` — list tracked source files.
 //!
-//! Displays a table of file rows from the state store, with optional filtering
-//! by status.  Columns are aligned to a fixed width so output is scannable at
-//! a glance.
+//! Displays a table of file rows, with optional filtering by status.
 //!
-//! Operates in **offline mode**: opens the SQLite database directly so the
-//! command works whether or not the daemon is running.
+//! **HTTP-first:** When the daemon is running, the file list is fetched via
+//! `GET /files`.  When offline the SQLite database is read directly.
 //!
 //! # Column widths
 //! ```text
@@ -18,10 +16,11 @@
 
 use std::str::FromStr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
-use kb_core::Status;
+use kb_core::{config::load_raw, Status};
 
+use crate::client::DaemonClient;
 use super::db::{fmt_ts, open_store, short_hash, truncate_path};
 
 // ── Argument types ─────────────────────────────────────────────────────────────
@@ -40,7 +39,7 @@ pub struct ListArgs {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(args: ListArgs) -> Result<()> {
-    // Validate the status filter before touching the DB.
+    // Validate the status filter early, before any I/O.
     let status_filter: Option<Status> = match &args.status {
         Some(s) => {
             let parsed = Status::from_str(s.as_str()).map_err(|_| {
@@ -58,11 +57,20 @@ pub async fn run(args: ListArgs) -> Result<()> {
         bail!("--limit must be at least 1");
     }
 
-    let store = open_store().await?;
-    let rows = store
-        .list_files(status_filter, args.limit as i64, 0)
-        .await?;
+    let limit = args.limit as i64;
 
+    // ── Fetch rows ────────────────────────────────────────────────────────────
+    let config = load_raw().context("failed to load configuration")?;
+    let rows = if let Some(client) = DaemonClient::try_connect(&config.ops.http_bind).await {
+        // HTTP mode
+        client.list_files(status_filter, limit, 0).await?
+    } else {
+        // DB fallback
+        let store = open_store().await?;
+        store.list_files(status_filter, limit, 0).await?
+    };
+
+    // ── Render ────────────────────────────────────────────────────────────────
     if rows.is_empty() {
         match &args.status {
             Some(s) => println!("No files with status '{s}'."),
@@ -71,14 +79,12 @@ pub async fn run(args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
-    // ── Column widths (fixed so the table stays tidy) ─────────────────────────
     const ID_W:     usize = 6;
     const STATUS_W: usize = 12;
     const PATH_W:   usize = 37;
     const HASH_W:   usize = 14;
     const TS_W:     usize = 19;
 
-    // ── Header ────────────────────────────────────────────────────────────────
     println!(
         " {:>ID_W$}  {:<STATUS_W$}  {:<PATH_W$}  {:<HASH_W$}  {:<TS_W$}",
         "ID", "Status", "Path", "Hash", "Updated",
@@ -92,11 +98,8 @@ pub async fn run(args: ListArgs) -> Result<()> {
         "─".repeat(TS_W),
     );
 
-    // ── Rows ──────────────────────────────────────────────────────────────────
     for row in &rows {
         let status_str = row.status.as_str();
-
-        // Append a marker for attention-worthy statuses.
         let status_display = match row.status {
             Status::Failed     => format!("{status_str} ◀"),
             Status::Processing => format!("{status_str} ●"),
@@ -123,7 +126,6 @@ pub async fn run(args: ListArgs) -> Result<()> {
         );
     }
 
-    // ── Footer ────────────────────────────────────────────────────────────────
     println!();
     let shown = rows.len();
     if shown == args.limit {
