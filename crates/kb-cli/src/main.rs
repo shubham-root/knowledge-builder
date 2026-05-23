@@ -19,6 +19,8 @@
 //! kb uninstall
 //! kb config   [show|path|validate]
 //! kb doctor                           Validate configuration
+//! kb backup   [--output <path>]       Create a database backup
+//! kb restore  <backup_path>           Restore from a backup
 //! ```
 
 use anyhow::Result;
@@ -81,6 +83,12 @@ enum Commands {
 
     /// Validate configuration and environment prerequisites.
     Doctor,
+
+    /// Create a compact, consistent backup of the state database (VACUUM INTO).
+    Backup(commands::backup::BackupArgs),
+
+    /// Restore the state database from a backup file.
+    Restore(commands::backup::RestoreArgs),
 }
 
 #[tokio::main]
@@ -102,5 +110,7 @@ async fn main() -> Result<()> {
         Commands::Uninstall      => commands::uninstall::run().await,
         Commands::Config(args)   => commands::config::run(args).await,
         Commands::Doctor         => commands::doctor::run().await,
+        Commands::Backup(args)   => commands::backup::run_backup(args).await,
+        Commands::Restore(args)  => commands::backup::run_restore(args).await,
     }
 }

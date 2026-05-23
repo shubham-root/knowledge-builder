@@ -7,10 +7,13 @@
 //! | 1–8 | Config fields (vault/sources paths, processor, DB, log dir, backoff) |
 //! | 9   | SQLite database integrity (`PRAGMA integrity_check`) if DB exists |
 //! | 10  | Log directory is writable |
+//! | 11  | Backup health (warns if no backups or last backup > 7 days old) |
 //!
 //! Exits 0 when all checks pass; exits 1 with a diagnostic listing otherwise.
 
 use anyhow::Result;
+
+use super::backup;
 
 // ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -100,6 +103,29 @@ pub async fn run() -> Result<()> {
         )),
     }
 
+    // ── Step 5: backup health ─────────────────────────────────────────────────
+    let db_path_for_backup = std::path::PathBuf::from(&config.paths.db_path);
+    match backup::last_backup_age_days(&db_path_for_backup) {
+        None => {
+            checker.warn(
+                "No database backups found. \
+                 Run `kb backup` to create one."
+                .to_string(),
+            );
+        }
+        Some(days) if days > 7 => {
+            checker.warn(format!(
+                "Last backup is {days} day(s) old (threshold: 7 days). \
+                 Run `kb backup` to refresh."
+            ));
+        }
+        Some(days) => {
+            checker.pass(&format!(
+                "Last backup is {days} day(s) old — within the 7-day window."
+            ));
+        }
+    }
+
     // ── Final verdict ─────────────────────────────────────────────────────────
     checker.print_summary();
     if !checker.all_passed {
@@ -127,23 +153,29 @@ impl Checker {
 
     fn pass(&mut self, msg: &str) {
         self.count += 1;
-        println!("  [{}] ✓  {}", self.count, msg);
+        println!("  [{}] \u{2713}  {}", self.count, msg);
+    }
+
+    /// Non-fatal warning — does not set `all_passed = false`.
+    fn warn(&mut self, msg: String) {
+        self.count += 1;
+        println!("  [{}] \u{26a0}\u{fe0f}  {msg}", self.count);
     }
 
     fn fail(&mut self, msg: String) {
         self.count += 1;
         self.all_passed = false;
-        eprintln!("  [{}] ✗  {}", self.count, msg);
+        eprintln!("  [{}] \u{2717}  {}", self.count, msg);
     }
 
     fn print_summary(&self) {
         println!();
         if self.all_passed {
-            println!("✓  All checks passed — daemon is ready to start.");
+            println!("\u{2713}  All checks passed \u{2014} daemon is ready to start.");
             println!("   Run: kb daemon --foreground");
         } else {
             eprintln!(
-                "✗  One or more checks failed. Fix the issues above and re-run `kb doctor`."
+                "\u{2717}  One or more checks failed. Fix the issues above and re-run `kb doctor`."
             );
         }
     }

@@ -1,5 +1,6 @@
 //! Subcommand modules for the `kb` CLI.
 
+pub mod backup;
 pub mod config;
 pub(crate) mod db;
 pub mod daemon;

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -63,7 +63,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ── Audit log ─────────────────────────────────────────────────────────
         .route("/events", get(get_events))
         // ── SSE tail ──────────────────────────────────────────────────────────
-        .route("/tail", get(tail_stub))
+        .route("/tail", get(tail_sse_handler))
         // ── Shared state ─────────────────────────────────────────────────────
         .with_state(state)
 }
@@ -474,19 +474,18 @@ async fn get_events(
 
 // ── /tail ─────────────────────────────────────────────────────────────────────
 
-/// `GET /tail` — SSE stream of new audit events (stub, T30).
+/// `GET /tail` — live SSE stream of audit events.
 ///
-/// Full SSE implementation lives in [`crate::sse`]; this stub returns a
-/// `501 Not Implemented` until T30 is complete.
-async fn tail_stub(_state: State<Arc<AppState>>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "not_implemented",
-            "message": "GET /tail SSE stream is pending T30 implementation",
-        })),
-    )
-        .into_response()
+/// Delegates all logic to [`crate::events::tail_sse`], which handles:
+/// - `Last-Event-ID` reconnect catchup from the DB
+/// - Live broadcast subscription
+/// - Optional `?level=` / `?kind=` filtering
+async fn tail_sse_handler(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    query: Query<crate::events::TailParams>,
+) -> impl IntoResponse {
+    crate::events::tail_sse(state, headers, query).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -510,10 +509,12 @@ mod tests {
         let store = kb_core::StateStore::new(&db_path, &[5u64, 30, 120])
             .await
             .expect("test state store");
+        let broadcaster = crate::EventBroadcaster::new(256);
         Arc::new(AppState {
             state_store: store,
             start_time: Instant::now(),
             scanner_trigger: None,
+            event_broadcaster: broadcaster,
         })
     }
 
@@ -554,6 +555,7 @@ mod tests {
             state_store: store,
             start_time: Instant::now() - std::time::Duration::from_secs(10),
             scanner_trigger: None,
+            event_broadcaster: crate::EventBroadcaster::new(256),
         });
         let app = router(state);
 
@@ -813,6 +815,7 @@ mod tests {
             state_store: store,
             start_time: Instant::now(),
             scanner_trigger: Some(tx),
+            event_broadcaster: crate::EventBroadcaster::new(256),
         });
         let app = router(state);
 
@@ -900,7 +903,7 @@ mod tests {
     // ── /tail ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn tail_returns_501() {
+    async fn tail_returns_sse_stream() {
         let state = test_state().await;
         let app = router(state);
 
@@ -915,7 +918,37 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        // Real SSE handler responds with 200 + text/event-stream
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "expected text/event-stream content-type, got: {content_type}",
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_with_filters_returns_sse_stream() {
+        let state = test_state().await;
+        let app = router(state);
+
+        // Filtering params should still produce a valid SSE response.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/tail?level=warn&kind=failed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ── Integration: file lifecycle ────────────────────────────────────────────

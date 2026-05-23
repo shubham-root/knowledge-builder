@@ -41,5 +41,8 @@ tracing = { workspace = true }
 # Terminal colors
 colored = { workspace = true }
 
+# SQLite (direct use in backup.rs for VACUUM INTO / integrity_check)
+rusqlite = { workspace = true }
+
 # UID lookup (install/uninstall)
 libc = { workspace = true }
