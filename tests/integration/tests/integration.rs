@@ -357,39 +357,51 @@ async fn scenario_08_processor_timeout_retried() {
     let pdf = vault.drop_file("timeout_test.pdf", b"timeout test content");
     vault.enqueue_direct(&pdf).await.unwrap();
 
-    // After the first timeout (~7 s), the row should be back in 'queued'
-    // (retryable failure with backoff).  We allow 10 s for safety.
-    let row = vault
-        .wait_for_any_status(
-            &pdf,
-            &[Status::Queued, Status::Processing, Status::Failed],
-            10_000,
-        )
+    // Step 1: Wait for the worker to CLAIM the job (Processing, attempts == 1).
+    // The worker polls every 100 ms, so this should happen within a second.
+    let processing_row = vault
+        .wait_for_status(&pdf, Status::Processing, 3_000)
         .await
-        .expect("row must transition out of its initial state");
+        .expect("worker must claim the job within 3 s");
+    assert_eq!(
+        processing_row.attempts, 1,
+        "attempts must be 1 after first claim"
+    );
 
-    if row.status == Status::Failed {
-        // Already exhausted all attempts (ran both cycles). Verify attempts >= 2.
-        assert!(
-            row.attempts >= 2,
-            "should have attempted at least twice before terminal fail"
+    // Step 2: After the timeout fires (2 s) + SIGTERM grace (5 s), the row goes
+    // back to 'queued' (retryable, backoff = 2 s).  Allow 10 s for this.
+    let retried_row = vault
+        .wait_for_any_status(&pdf, &[Status::Queued, Status::Failed], 10_000)
+        .await
+        .expect("row must transition out of Processing within 10 s");
+
+    if retried_row.status == Status::Queued {
+        // Row is waiting for the backoff to expire.
+        assert_eq!(
+            retried_row.attempts, 1,
+            "attempts must still be 1 while queued after first retry"
         );
-    } else {
-        // Still cycling — the row is queued or being processed again.
-        // Confirm attempts > 0 (was claimed at least once).
         assert!(
-            row.attempts >= 1,
-            "attempts must be > 0 after at least one timeout"
+            retried_row.next_attempt_at.is_some(),
+            "next_attempt_at must be set for a retryable failure"
         );
 
-        // Eventually the row must reach terminal 'failed' (both attempts exhausted).
+        // Step 3: Wait for the second cycle to exhaust all attempts → Failed.
         let final_row = vault
-            .wait_for_status(&pdf, Status::Failed, 25_000)
+            .wait_for_status(&pdf, Status::Failed, 20_000)
             .await
-            .expect("row must reach terminal 'failed' after all retries");
+            .expect("row must reach terminal Failed after both attempts");
         assert!(
             final_row.attempts >= 2,
-            "row must have been attempted at least twice"
+            "must have attempted at least twice, got attempts={}",
+            final_row.attempts,
+        );
+    } else {
+        // Already terminal Failed (both cycles completed).
+        assert!(
+            retried_row.attempts >= 2,
+            "terminal Failed must have attempts >= 2, got {}",
+            retried_row.attempts
         );
     }
 
