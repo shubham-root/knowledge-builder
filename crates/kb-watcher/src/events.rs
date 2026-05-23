@@ -262,7 +262,7 @@ impl FileWatcher {
 // ── Filtering ─────────────────────────────────────────────────────────────────
 
 /// Build a [`GlobSet`] from a list of glob pattern strings.
-fn build_glob_set(patterns: &[String]) -> Result<GlobSet, WatcherError> {
+pub(crate) fn build_glob_set(patterns: &[String]) -> Result<GlobSet, WatcherError> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let glob = Glob::new(pattern).map_err(|e| WatcherError::GlobBuild {
@@ -287,7 +287,7 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet, WatcherError> {
 /// 3. No `*.icloud` placeholder files.
 /// 4. Extension in the allowlist (case-insensitive).
 /// 5. Full path does not match any ignore-glob.
-fn is_allowed(path: &Path, extensions: &[String], ignore_set: &GlobSet) -> bool {
+pub(crate) fn is_allowed(path: &Path, extensions: &[String], ignore_set: &GlobSet) -> bool {
     // 1. Reject dotfiles — any Normal component whose name starts with '.'
     for component in path.components() {
         if let Component::Normal(os_str) = component {

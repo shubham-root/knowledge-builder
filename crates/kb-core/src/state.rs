@@ -93,6 +93,11 @@ pub enum StateOp {
         reply:     oneshot::Sender<crate::Result<()>>,
     },
     RecoverInFlight {
+        /// Maximum total processing attempts allowed per file.  Rows whose
+        /// `attempts` count meets or exceeds this threshold after the
+        /// crash-recovery increment are set to `'failed'` (terminal) rather
+        /// than `'queued'` (retryable).
+        max_attempts: i32,
         reply: oneshot::Sender<crate::Result<usize>>,
     },
     FindByPath {
@@ -300,10 +305,45 @@ impl StateStore {
 
     /// Reset all `'processing'` rows to `'queued'` after a crash.
     ///
-    /// Intended to be called once on daemon startup.  Returns the count of
-    /// recovered rows and emits an audit event if any were found.
+    /// Uses `i32::MAX` as the `max_attempts` ceiling — effectively no limit.
+    /// For daemon startup use [`recover_in_flight_with_config`] with the
+    /// value from `config.worker.max_attempts`.
+    ///
+    /// Returns the count of recovered rows.
     pub async fn recover_in_flight(&self) -> crate::Result<usize> {
-        self.send(|reply| StateOp::RecoverInFlight { reply }).await
+        self.send(|reply| StateOp::RecoverInFlight {
+            max_attempts: i32::MAX,
+            reply,
+        })
+        .await
+    }
+
+    /// Reset all `'processing'` rows to `'queued'` (or `'failed'` if
+    /// attempts are exhausted) after a crash.
+    ///
+    /// # Behaviour (per row)
+    ///
+    /// 1. Increment `attempts` — the crash counts as one attempt.
+    /// 2. If the new `attempts >= max_attempts`: transition to `'failed'`
+    ///    with `last_error = "max attempts exhausted after crash recovery"`.
+    /// 3. Otherwise: transition to `'queued'` with `next_attempt_at = NULL`
+    ///    (eligible for immediate pick-up).
+    /// 4. Emit one `'recovered'` audit event per row.
+    ///
+    /// Logs at `INFO` level with the count of recovered jobs.
+    ///
+    /// # When to call
+    /// Exactly once at daemon startup, **before** the worker pool begins
+    /// claiming jobs.
+    ///
+    /// # Arguments
+    /// * `max_attempts` — value from `config.worker.max_attempts`.
+    pub async fn recover_in_flight_with_config(
+        &self,
+        max_attempts: i32,
+    ) -> crate::Result<usize> {
+        self.send(|reply| StateOp::RecoverInFlight { max_attempts, reply })
+            .await
     }
 
     /// Look up a file row by its canonical absolute path.
@@ -489,8 +529,8 @@ impl StateActor {
             StateOp::MarkFailed { id, error, retryable, reply } => {
                 let _ = reply.send(self.mark_failed(id, error, retryable));
             }
-            StateOp::RecoverInFlight { reply } => {
-                let _ = reply.send(self.recover_in_flight());
+            StateOp::RecoverInFlight { max_attempts, reply } => {
+                let _ = reply.send(self.recover_in_flight(max_attempts));
             }
             StateOp::FindByPath { path, reply } => {
                 let _ = reply.send(self.find_by_path(path));
@@ -963,28 +1003,89 @@ impl StateActor {
         Ok(())
     }
 
-    fn recover_in_flight(&self) -> crate::Result<usize> {
+    /// Crash recovery: inspect every `'processing'` row, increment its
+    /// `attempts` counter (the crash counts as one attempt), then either
+    /// re-queue it or mark it permanently failed depending on `max_attempts`.
+    ///
+    /// Per-row audit events are emitted inside this method.  INFO-level
+    /// tracing spans are emitted at the end.
+    fn recover_in_flight(&self, max_attempts: i32) -> crate::Result<usize> {
         let now = Self::now();
 
-        // Reset every `processing` row back to `queued`.  `attempts` was
-        // already incremented by `claim_next` during the previous run, so
-        // it accurately reflects the total number of attempts including the
-        // crashed one.
-        let count = self.conn.execute(
-            "UPDATE files \
-             SET status = 'queued', next_attempt_at = NULL, updated_at = ?1 \
-             WHERE status = 'processing'",
-            [now],
-        )?;
+        // ── 1. Collect all in-flight rows ────────────────────────────────────
+        let sql = format!(
+            "SELECT {} FROM files WHERE status = 'processing'",
+            Self::FILE_COLS,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<FileRow> = stmt
+            .query_map([], |r| Self::map_file_row(r))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let count = rows.len();
+
+        // ── 2. Process each row individually ─────────────────────────────────
+        for row in &rows {
+            // The crash itself counts as one attempt — increment now so the
+            // next claim (if any) starts from an accurate baseline.
+            let new_attempts = row.attempts + 1;
+
+            if new_attempts >= max_attempts {
+                // Attempts exhausted: mark as terminal failure.
+                self.conn.execute(
+                    "UPDATE files \
+                     SET status = 'failed', \
+                         attempts = ?1, \
+                         last_error = 'max attempts exhausted after crash recovery', \
+                         next_attempt_at = NULL, \
+                         updated_at = ?2 \
+                     WHERE id = ?3",
+                    rusqlite::params![new_attempts, now, row.id],
+                )?;
+
+                self.record_event_op(
+                    "warn",
+                    event_kind::RECOVERED,
+                    Some(row.id),
+                    &format!(
+                        "Marked failed after crash recovery (attempts {new_attempts} >= \
+                         max_attempts {max_attempts}): {}",
+                        row.path.display()
+                    ),
+                    None,
+                )?;
+            } else {
+                // Attempts not yet exhausted: reset to queued for retry.
+                self.conn.execute(
+                    "UPDATE files \
+                     SET status = 'queued', \
+                         attempts = ?1, \
+                         next_attempt_at = NULL, \
+                         updated_at = ?2 \
+                     WHERE id = ?3",
+                    rusqlite::params![new_attempts, now, row.id],
+                )?;
+
+                self.record_event_op(
+                    "info",
+                    event_kind::RECOVERED,
+                    Some(row.id),
+                    "Reset from processing to queued after daemon restart",
+                    None,
+                )?;
+            }
+        }
+
+        // ── 3. Structured log ────────────────────────────────────────────────
         if count > 0 {
-            self.record_event_op(
-                "warn",
-                crate::types::event_kind::RECOVERED,
-                None,
-                &format!("recovered {count} in-flight job(s) after unclean shutdown"),
-                None,
-            )?;
+            tracing::info!(
+                recovered = count,
+                max_attempts = max_attempts,
+                "Recovered {} in-flight job(s) from previous crash",
+                count
+            );
+        } else {
+            tracing::info!("No in-flight jobs to recover");
         }
 
         Ok(count)
@@ -1437,6 +1538,192 @@ mod tests {
         let recovered = store.get_file_by_id(row.id).await.unwrap().unwrap();
         assert_eq!(recovered.status, Status::Queued);
     }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // recover_in_flight_with_config — §3.10 crash recovery tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper: create a file row that is currently in `processing` status.
+    /// Returns the `FileRow` as returned by `claim_next` (attempts = 1).
+    async fn put_file_in_processing(store: &StateStore, path: &str, hash: &str) -> FileRow {
+        let row = store
+            .register_seen(PathBuf::from(path), Some(512), None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, hash.into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        store.claim_next().await.unwrap().expect("should claim")
+    }
+
+    /// Multiple `processing` rows recover to `queued` with incremented attempts.
+    #[tokio::test]
+    async fn recover_with_config_resets_multiple_rows_to_queued() {
+        let store = open_test_store().await;
+
+        // Put three files into 'processing' (each gets attempts = 1 from claim_next).
+        let r1 = put_file_in_processing(&store, "/tmp/rc1.pdf", "sha256:rc001").await;
+        let r2 = put_file_in_processing(&store, "/tmp/rc2.pdf", "sha256:rc002").await;
+        let r3 = put_file_in_processing(&store, "/tmp/rc3.pdf", "sha256:rc003").await;
+
+        // max_attempts = 5 → none exhausted (attempts = 2 after recovery, 2 < 5).
+        let count = store.recover_in_flight_with_config(5).await.unwrap();
+        assert_eq!(count, 3, "should recover all three rows");
+
+        for id in [r1.id, r2.id, r3.id] {
+            let row = store.get_file_by_id(id).await.unwrap().unwrap();
+            assert_eq!(row.status, Status::Queued, "row {id} should be queued");
+            assert_eq!(
+                row.attempts, 2,
+                "row {id}: attempts = 1 (claim_next) + 1 (recovery increment) = 2",
+            );
+            assert!(
+                row.next_attempt_at.is_none(),
+                "row {id}: next_attempt_at must be NULL (immediately eligible)",
+            );
+        }
+    }
+
+    /// A row whose attempts reach max_attempts during recovery is set to `failed`.
+    #[tokio::test]
+    async fn recover_with_config_fails_exhausted_rows() {
+        let store = open_test_store().await;
+
+        // claim_next sets attempts = 1.
+        // Recovery increments to 2.  With max_attempts = 2: 2 >= 2 → failed.
+        let row = put_file_in_processing(&store, "/tmp/rc_fail.pdf", "sha256:rcfail").await;
+        assert_eq!(row.attempts, 1);
+
+        let count = store.recover_in_flight_with_config(2).await.unwrap();
+        assert_eq!(count, 1);
+
+        let recovered = store.get_file_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(
+            recovered.status,
+            Status::Failed,
+            "exhausted row must become 'failed'",
+        );
+        assert_eq!(
+            recovered.attempts, 2,
+            "attempts must be incremented even on exhausted rows",
+        );
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("max attempts exhausted after crash recovery"),
+        );
+        assert!(
+            recovered.next_attempt_at.is_none(),
+            "failed rows must have no scheduled next attempt",
+        );
+    }
+
+    /// Mixed batch: rows below the limit recover; a row at the limit fails.
+    #[tokio::test]
+    async fn recover_with_config_mixed_batch() {
+        let store = open_test_store().await;
+
+        let ra = put_file_in_processing(&store, "/tmp/rc_mix_a.pdf", "sha256:rca").await;
+        let rb = put_file_in_processing(&store, "/tmp/rc_mix_b.pdf", "sha256:rcb").await;
+
+        // First recovery with max_attempts = 3 → attempts becomes 2, 2 < 3 → both queued.
+        let count1 = store.recover_in_flight_with_config(3).await.unwrap();
+        assert_eq!(count1, 2);
+        assert_eq!(
+            store.get_file_by_id(ra.id).await.unwrap().unwrap().status,
+            Status::Queued,
+        );
+        assert_eq!(
+            store.get_file_by_id(rb.id).await.unwrap().unwrap().status,
+            Status::Queued,
+        );
+
+        // Claim them again (attempts becomes 3 each).
+        store.claim_next().await.unwrap().expect("should claim ra");
+        store.claim_next().await.unwrap().expect("should claim rb");
+
+        // Second recovery with max_attempts = 3 → attempts becomes 4, 4 >= 3 → both failed.
+        let count2 = store.recover_in_flight_with_config(3).await.unwrap();
+        assert_eq!(count2, 2);
+        assert_eq!(
+            store.get_file_by_id(ra.id).await.unwrap().unwrap().status,
+            Status::Failed,
+        );
+        assert_eq!(
+            store.get_file_by_id(rb.id).await.unwrap().unwrap().status,
+            Status::Failed,
+        );
+    }
+
+    /// One `recovered` audit event is emitted per row, not one for the whole batch.
+    #[tokio::test]
+    async fn recover_with_config_emits_per_row_audit_events() {
+        let store = open_test_store().await;
+
+        put_file_in_processing(&store, "/tmp/rc_evt1.pdf", "sha256:rcevt1").await;
+        put_file_in_processing(&store, "/tmp/rc_evt2.pdf", "sha256:rcevt2").await;
+
+        store.recover_in_flight_with_config(5).await.unwrap();
+
+        let events = store
+            .get_events(None, None, Some("recovered".into()), 20)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly one 'recovered' audit event per file",
+        );
+
+        for ev in &events {
+            assert!(ev.file_id.is_some(), "audit event must reference the file_id");
+            assert!(
+                ev.message.contains("Reset from processing to queued"),
+                "expected recovery message; got: {:?}",
+                ev.message,
+            );
+        }
+    }
+
+    /// The audit event for an exhausted row mentions exhaustion / failure.
+    #[tokio::test]
+    async fn recover_with_config_failed_row_audit_event_wording() {
+        let store = open_test_store().await;
+
+        let row =
+            put_file_in_processing(&store, "/tmp/rc_fail_evt.pdf", "sha256:rfevt").await;
+        // 1 + 1 = 2 >= 2 → failed
+        store.recover_in_flight_with_config(2).await.unwrap();
+
+        let events = store
+            .get_events(None, None, Some("recovered".into()), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].file_id, Some(row.id));
+
+        let msg = &events[0].message;
+        assert!(
+            msg.contains("failed") || msg.contains("exhausted"),
+            "unexpected failure event message: {msg:?}",
+        );
+    }
+
+    /// Returns 0 when no rows are in `processing` state.
+    #[tokio::test]
+    async fn recover_with_config_no_in_flight_returns_zero() {
+        let store = open_test_store().await;
+
+        // A queued (not processing) row must not be affected.
+        store
+            .register_seen(PathBuf::from("/tmp/rc_zero_q.pdf"), None, None, None)
+            .await
+            .unwrap();
+
+        let count = store.recover_in_flight_with_config(3).await.unwrap();
+        assert_eq!(count, 0, "no processing rows → should return 0");
+    }
+
 
     #[tokio::test]
     async fn stats_returns_correct_counts() {
