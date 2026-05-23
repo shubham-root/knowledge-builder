@@ -213,14 +213,6 @@ pub struct StateStore {
     sender: mpsc::Sender<StateOp>,
 }
 
-impl std::fmt::Debug for StateStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StateStore")
-            .field("channel_capacity", &self.sender.capacity())
-            .finish_non_exhaustive()
-    }
-}
-
 impl StateStore {
     /// Open (or create) the database at `db_path`, run all pending migrations,
     /// and start the background actor thread.
@@ -2626,5 +2618,185 @@ mod tests {
         assert_eq!(row.size,     Some(111));
         assert_eq!(row.mtime_ns, Some(222_000));
         assert_eq!(row.inode,    Some(33));
+    }
+}
+
+// ─── Prune + Storage tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prune_storage_tests {
+    use super::*;
+    use crate::types::{ProcessOutput, Status};
+
+    async fn make_store() -> StateStore {
+        let dir  = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        Box::leak(Box::new(dir));
+        StateStore::new(&path, &[]).await.expect("StateStore::new")
+    }
+
+    /// Insert a done file row with an output record, returning the file id.
+    async fn insert_done(store: &StateStore, path: &str, hash: &str, ext_bytes: i64) -> i64 {
+        let row = store
+            .register_seen(PathBuf::from(path), Some(ext_bytes), None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, hash.into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        let claimed = store.claim_next().await.unwrap().unwrap();
+        store
+            .mark_done(
+                claimed.id,
+                vec![ProcessOutput {
+                    path:  PathBuf::from(format!("{path}.md")),
+                    kind:  "markdown".into(),
+                    bytes: 1024,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        claimed.id
+    }
+
+    // ── prune: basic dry-run ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_dry_run_returns_rows_without_deleting() {
+        let store = make_store().await;
+        let id = insert_done(&store, "/vault/sources/a.pdf", "sha256:aaa", 100).await;
+
+        let result = store
+            .prune_files(None, Status::Done, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count,   1, "file_count mismatch");
+        assert_eq!(result.output_count, 1, "output_count mismatch");
+        assert_eq!(result.files.len(),  1, "dry-run must return rows");
+        assert_eq!(result.files[0].id, id);
+
+        // Row must NOT have been deleted.
+        let still_there = store.get_file_by_id(id).await.unwrap();
+        assert!(still_there.is_some(), "dry-run must not delete rows");
+    }
+
+    // ── prune: actual delete ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_deletes_rows_and_outputs() {
+        let store = make_store().await;
+        let id = insert_done(&store, "/vault/sources/b.pdf", "sha256:bbb", 200).await;
+
+        let result = store
+            .prune_files(None, Status::Done, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count,   1);
+        assert_eq!(result.output_count, 1);
+        assert!(result.files.is_empty(), "non-dry-run must not return rows");
+
+        // Row must be gone.
+        let gone = store.get_file_by_id(id).await.unwrap();
+        assert!(gone.is_none(), "file row must have been deleted");
+    }
+
+    // ── prune: before_ts filter ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_before_ts_filters_by_updated_at() {
+        let store = make_store().await;
+        insert_done(&store, "/vault/sources/old.pdf", "sha256:old", 100).await;
+        insert_done(&store, "/vault/sources/new.pdf", "sha256:new", 200).await;
+
+        // Prune only rows updated before far-future timestamp — should get both.
+        let result = store
+            .prune_files(Some(i64::MAX), Status::Done, true)
+            .await
+            .unwrap();
+        assert_eq!(result.file_count, 2);
+
+        // Prune only rows updated before epoch 0 — should get none.
+        let result = store
+            .prune_files(Some(0), Status::Done, true)
+            .await
+            .unwrap();
+        assert_eq!(result.file_count, 0);
+    }
+
+    // ── prune: status filter ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_only_affects_matching_status() {
+        let store = make_store().await;
+
+        // Insert a done file and a failed file.
+        insert_done(&store, "/vault/sources/done.pdf", "sha256:done1", 100).await;
+
+        let row = store
+            .register_seen(PathBuf::from("/vault/sources/fail.pdf"), Some(50), None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, "sha256:fail1".into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        let claimed = store.claim_next().await.unwrap().unwrap();
+        store
+            .mark_failed(claimed.id, "oops".into(), false)
+            .await
+            .unwrap();
+
+        // Prune only done rows — failed should survive.
+        let result = store
+            .prune_files(None, Status::Done, false)
+            .await
+            .unwrap();
+        assert_eq!(result.file_count, 1);
+
+        let failed_still = store
+            .list_files(Some(Status::Failed), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(failed_still.len(), 1, "failed row must survive done prune");
+    }
+
+    // ── storage stats ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn storage_stats_groups_by_extension_and_kind() {
+        let store = make_store().await;
+        insert_done(&store, "/vault/sources/doc1.pdf",  "sha256:p1", 1_000_000).await;
+        insert_done(&store, "/vault/sources/doc2.pdf",  "sha256:p2", 2_000_000).await;
+        insert_done(&store, "/vault/sources/doc3.docx", "sha256:d1",   500_000).await;
+
+        let stats = store.get_storage_stats().await.unwrap();
+
+        assert_eq!(stats.total_source_count, 3);
+        // Two outputs from the two done PDF rows + one from docx.
+        assert_eq!(stats.total_output_count, 3);
+
+        // Check extension grouping.
+        let pdf  = stats.by_ext.iter().find(|e| e.ext == "pdf").unwrap();
+        let docx = stats.by_ext.iter().find(|e| e.ext == "docx").unwrap();
+        assert_eq!(pdf.count,  2);
+        assert_eq!(docx.count, 1);
+        assert_eq!(pdf.bytes,  3_000_000); // 1M + 2M
+
+        // Sorted largest-first.
+        assert!(stats.by_ext[0].bytes >= stats.by_ext[stats.by_ext.len() - 1].bytes);
+
+        // Output kind must be "markdown".
+        assert!(stats.by_kind.iter().any(|k| k.kind == "markdown"));
+    }
+
+    #[tokio::test]
+    async fn storage_stats_empty_db() {
+        let store = make_store().await;
+        let stats = store.get_storage_stats().await.unwrap();
+        assert_eq!(stats.total_source_count, 0);
+        assert_eq!(stats.total_output_count, 0);
+        assert_eq!(stats.total_bytes, 0);
+        assert!(stats.by_ext.is_empty());
+        assert!(stats.by_kind.is_empty());
     }
 }

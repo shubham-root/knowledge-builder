@@ -51,9 +51,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // does not attempt to parse it as a numeric id.
         .route("/files", get(list_files_stub))
         .route("/files/by-path", get(files_by_path_stub))
-        .route("/files/:id", get(get_file_stub))
-        .route("/files/:id/requeue", post(requeue_file_stub))
-        .route("/files/:id/reset", post(reset_file_stub))
+        .route("/files/{id}", get(get_file_stub))
+        .route("/files/{id}/requeue", post(requeue_file_stub))
+        .route("/files/{id}/reset", post(reset_file_stub))
         // ── Actions ───────────────────────────────────────────────────────────
         .route("/scan", post(scan_stub))
         // ── Audit log ─────────────────────────────────────────────────────────
@@ -163,7 +163,6 @@ mod tests {
         body::Body,
         http::{Method, Request},
     };
-    use std::path::Path;
     use std::time::Instant;
     use tower::ServiceExt; // for `oneshot`
 

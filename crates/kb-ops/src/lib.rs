@@ -49,7 +49,10 @@ use kb_core::StateStore;
 /// Clone is derived so the `Arc<AppState>` axum extension can be cheaply
 /// extracted in each request handler.  The inner fields that are themselves
 /// `Clone` (like [`StateStore`]) can be cloned from the extracted reference.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually because [`StateStore`] does not implement
+/// [`std::fmt::Debug`].
+#[derive(Clone)]
 pub struct AppState {
     /// Handle to the single-writer SQLite state actor.
     pub state_store: StateStore,
@@ -63,6 +66,15 @@ pub struct AppState {
     /// one scan cycle immediately (used by `POST /scan`).  `None` when the
     /// scanner is not running (e.g. in unit tests).
     pub scanner_trigger: Option<mpsc::Sender<()>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("start_time", &self.start_time)
+            .field("scanner_trigger", &self.scanner_trigger.as_ref().map(|_| "<Sender<()>>"))
+            .finish_non_exhaustive()
+    }
 }
 
 // ── start_server ──────────────────────────────────────────────────────────────
