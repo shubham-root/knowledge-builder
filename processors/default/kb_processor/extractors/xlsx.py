@@ -11,8 +11,8 @@ Structured output contract
 --------------------------
 The :class:`ExtractionResult` returned by :meth:`XlsxExtractor.extract` uses:
 
-* ``text`` — full Markdown representation with all sheets rendered as tables.
-* ``images`` — always empty (spreadsheets carry no raster images in typical use).
+* ``content`` — full Markdown representation with all sheets rendered as tables.
+* ``images``   — always empty (spreadsheets carry no raster images in typical use).
 * ``metadata`` — dict with keys:
 
   .. code-block:: python
@@ -69,6 +69,7 @@ def _check_conversion_status(result: Any, path: Path) -> None:
 
 
 def _is_transient_error(message: str) -> bool:
+    """Classify I/O errors as transient vs. format errors as permanent."""
     msg_lower = message.lower()
     permanent_hints = ("password", "encrypt", "protected", "corrupt",
                        "not a valid", "invalid", "unsupported format")
@@ -79,10 +80,10 @@ def _sheet_name_from_table(table: Any, doc: Any, index: int) -> str:
     """
     Best-effort sheet name from a docling ``TableItem``.
 
-    Tries caption (some versions expose the sheet name there), then falls
+    Tries caption_text(doc), then the .caption attribute, then falls
     back to ``"Sheet {index}"`` (1-based).
     """
-    # Try caption_text(doc) — callable in some docling versions
+    # Try callable caption_text(doc)
     try:
         text = table.caption_text(doc).strip()
         if text:
@@ -106,7 +107,7 @@ def _extract_sheets(doc: Any) -> list[dict[str, str]]:
     Build the ``sheets`` metadata list from docling table items.
 
     Returns a list of ``{"name": str, "content": str}`` dicts.  Empty
-    tables produce an empty *content* string but are still listed.
+    tables (no rows) produce an empty *content* string but are still listed.
     """
     sheets: list[dict[str, str]] = []
     try:
@@ -135,33 +136,31 @@ def _extract_sheets(doc: Any) -> list[dict[str, str]]:
 class XlsxExtractor(BaseExtractor):
     """
     Extract cell data from an ``.xlsx`` file using ``docling``.
-
-    Parameters
-    ----------
-    path:
-        Absolute path to the ``.xlsx`` source file.
-    work_dir:
-        Per-job working directory (not used for XLSX but required by the
-        :class:`BaseExtractor` interface).
     """
 
     #: File extensions handled by this extractor.
     EXTENSIONS: frozenset[str] = frozenset({".xlsx", ".xls"})
 
-    @classmethod
-    def can_handle(cls, path: Path) -> bool:
+    def can_handle(self, path: Path) -> bool:
         """Return ``True`` for ``.xlsx`` / ``.xls`` files."""
-        return path.suffix.lower() in cls.EXTENSIONS
+        return path.suffix.lower() in self.EXTENSIONS
 
-    def extract(self) -> ExtractionResult:
+    def extract(self, input_path: Path, work_dir: Path) -> ExtractionResult:
         """
-        Convert the XLSX workbook at :attr:`path` to Markdown tables.
+        Convert the XLSX workbook at *input_path* to Markdown tables.
+
+        Parameters
+        ----------
+        input_path:
+            Absolute path to the ``.xlsx`` source file.
+        work_dir:
+            Per-job working directory (not used for XLSX but required by the
+            :class:`BaseExtractor` interface).
 
         Returns
         -------
         ExtractionResult
-            ``text`` is the full Markdown;
-            ``images`` is always empty;
+            ``content`` is the full Markdown; ``images`` is always empty;
             ``metadata`` has ``table_count`` and a ``sheets`` list.
 
         Raises
@@ -171,43 +170,39 @@ class XlsxExtractor(BaseExtractor):
             * ``retryable=True``  — transient I/O error.
         """
         DocumentConverter = _import_docling()  # noqa: N806
-        logger.info("XlsxExtractor: converting '%s'", self.path)
+        logger.info("XlsxExtractor: converting '%s'", input_path)
 
         try:
             converter = DocumentConverter()
-            result = converter.convert(str(self.path))
+            result = converter.convert(str(input_path))
         except ExtractionError:
             raise
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             raise ExtractionError(
-                f"docling failed to convert XLSX '{self.path}': {msg}",
+                f"docling failed to convert XLSX '{input_path}': {msg}",
                 retryable=_is_transient_error(msg),
             ) from exc
 
-        _check_conversion_status(result, self.path)
+        _check_conversion_status(result, input_path)
 
         try:
             doc = result.document
             markdown: str = doc.export_to_markdown()
         except Exception as exc:  # noqa: BLE001
             raise ExtractionError(
-                f"Failed to export XLSX '{self.path}' to Markdown: {exc}",
+                f"Failed to export XLSX '{input_path}' to Markdown: {exc}",
                 retryable=False,
             ) from exc
 
         if not markdown.strip():
-            logger.info("XlsxExtractor: '%s' produced no content (all empty sheets).", self.path)
-            return ExtractionResult(
-                text="",
-                images=[],
-                metadata={"table_count": 0, "sheets": []},
-            )
+            logger.info("XlsxExtractor: '%s' produced no content (all empty sheets).", input_path)
+            return ExtractionResult(content="", images=[], metadata={"table_count": 0, "sheets": []})
 
         sheets = _extract_sheets(doc)
         logger.info("XlsxExtractor: done — %d chars, %d sheet(s).", len(markdown), len(sheets))
         return ExtractionResult(
-            text=markdown,
+            content=markdown,
             images=[],
             metadata={"table_count": len(sheets), "sheets": sheets},
         )
