@@ -10,19 +10,7 @@
 use std::path::Path;
 use rusqlite::Connection;
 use crate::migrations;
-
-/// Outcome of attempting to enqueue a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnqueueOutcome {
-    /// Row is now `queued`.
-    Queued,
-    /// Another row with the same content hash is `done`; this row is `skipped`.
-    SkippedDuplicate,
-    /// Row was already `queued` or `processing`; no change made.
-    AlreadyPending,
-    /// Row was already `done` with the same hash; no change needed.
-    AlreadyDone,
-}
+use crate::types::Stats;
 
 /// Synchronous handle to the SQLite state store.
 ///
@@ -57,12 +45,12 @@ impl StateStore {
     }
 
     /// Return aggregate counts per status.
-    pub fn stats(&self) -> crate::Result<crate::types::Stats> {
-        use crate::types::Stats;
+    pub fn stats(&self) -> crate::Result<Stats> {
         let mut stmt = self.conn.prepare(
             "SELECT status, COUNT(*) FROM files GROUP BY status",
         )?;
         let mut stats = Stats::default();
+        // Derived field: sum of queued + processing
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -78,6 +66,7 @@ impl StateStore {
                 _            => {}
             }
         }
+        stats.queue_depth = stats.queued + stats.processing;
         Ok(stats)
     }
 

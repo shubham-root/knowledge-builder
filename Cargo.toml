@@ -64,6 +64,9 @@ clap             = { version = "4",    features = ["derive"] }
 # Async stream utilities (used by kb-ops SSE)
 futures-util     = { version = "0.3", default-features = false, features = ["std"] }
 
+# Testing utilities
+tempfile   = { version = "3" }
+
 # Inter-crate dependencies
 kb-core    = { path = "crates/kb-core" }
 kb-watcher = { path = "crates/kb-watcher" }

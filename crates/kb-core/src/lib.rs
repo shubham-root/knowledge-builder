@@ -1,14 +1,17 @@
 //! `kb-core` — Foundation crate for Knowledge Builder.
 //!
 //! Provides:
-//! - Shared types (`FileRow`, `Status`, `ProcessResult`, `OutputRecord`, `Config`)
-//! - Configuration loading via `figment` (TOML + env-var overrides)
-//! - SQLite state store (single-writer tokio actor pattern)
-//! - Path invariant utilities (`canonicalize`, `is_inside`, `validate_output`)
-//! - Tracing / logging initialisation (JSON file layer + stderr human layer)
-//! - SQLite schema migrations
+//! - Shared types ([`FileRow`], [`Status`], [`ProcessResult`], [`OutputRecord`],
+//!   [`AuditEvent`], [`ProcessorInput`], [`ProcessOutput`], [`EnqueueOutcome`],
+//!   [`Stats`]) — all re-exported at the crate root for ergonomic imports.
+//! - Configuration loading via `figment` (TOML + `KB__` env-var overrides).
+//! - SQLite state store (single-writer tokio actor pattern).
+//! - Path invariant utilities ([`paths::canonicalize`], [`paths::is_inside`],
+//!   [`paths::validate_output`]).
+//! - Tracing / logging initialisation (JSON file layer + stderr human layer).
+//! - SQLite schema migrations (idempotent, append-only).
 //!
-//! All other crates depend on this one; keep its public API stable.
+//! All other crates depend on this one; keep the public API stable.
 
 pub mod config;
 pub mod migrations;
@@ -17,5 +20,35 @@ pub mod state;
 pub mod tracing_setup;
 pub mod types;
 
-/// Re-export the crate-level `Result` alias used throughout Knowledge Builder.
+// ── Crate-level re-exports ────────────────────────────────────────────────────
+//
+// Import the types that every downstream crate will use most often directly
+// from `kb_core::` rather than `kb_core::types::`.
+
+pub use types::{
+    // Status state machine
+    Status,
+
+    // Database row types
+    AuditEvent,
+    FileRow,
+    OutputRecord,
+
+    // Processor contract
+    ProcessOutput,
+    ProcessResult,
+    ProcessorInput,
+
+    // Queue outcome
+    EnqueueOutcome,
+
+    // Aggregate stats
+    Stats,
+
+    // Well-known event kind string constants
+    event_kind,
+};
+
+/// Crate-level `Result` alias: all fallible functions return
+/// `kb_core::Result<T>` which is `anyhow::Result<T>` under the hood.
 pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;

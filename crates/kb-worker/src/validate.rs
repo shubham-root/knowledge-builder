@@ -10,20 +10,20 @@
 //! Full implementation: T18.
 
 use std::path::{Path, PathBuf};
-use kb_core::types::OutputEntry;
+use kb_core::types::ProcessOutput;
 
 /// Validate every output entry returned by the processor.
 ///
 /// Returns a `Vec<PathBuf>` of canonicalized output paths on success, or the
 /// first [`kb_core::paths::PathError`] encountered.
 pub fn validate_outputs(
-    outputs:     &[OutputEntry],
+    outputs:     &[ProcessOutput],
     vault_root:  &Path,
     sources_dir: &Path,
 ) -> kb_core::Result<Vec<PathBuf>> {
     let mut canonical_paths = Vec::with_capacity(outputs.len());
-    for entry in outputs {
-        let canon = kb_core::paths::validate_output(&entry.path, vault_root, sources_dir)
+    for output in outputs {
+        let canon = kb_core::paths::validate_output(&output.path, vault_root, sources_dir)
             .map_err(|e| anyhow::anyhow!("invalid_output_path: {e}"))?;
         canonical_paths.push(canon);
     }
