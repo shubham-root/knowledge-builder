@@ -289,7 +289,7 @@ impl Config {
     /// Returns `Err` if *any* validation check fails.  The error message lists
     /// all failures so the operator can fix them all in one edit.
     pub fn load() -> crate::Result<Self> {
-        let mut cfg = Self::load_raw()?;
+        let mut cfg = load_raw()?;
         cfg = expand_all_paths(cfg);
         cfg.validate().map_err(|errs| {
             anyhow::anyhow!("{}", ConfigErrors(errs))

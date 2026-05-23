@@ -27,8 +27,11 @@ anyhow           = { version = "1" }
 
 # Logging / tracing
 tracing          = { version = "0.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 tracing-appender = { version = "0.2" }
+
+# TTY detection
+libc             = { version = "0.2" }
 
 # SQLite (statically linked)
 rusqlite         = { version = "0.32", features = ["bundled"] }

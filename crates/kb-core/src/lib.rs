@@ -14,6 +14,7 @@
 //! All other crates depend on this one; keep the public API stable.
 
 pub mod config;
+pub mod logging;
 pub mod migrations;
 pub mod paths;
 pub mod state;
@@ -21,6 +22,9 @@ pub mod tracing_setup;
 pub mod types;
 
 // ── Crate-level re-exports ────────────────────────────────────────────────────
+
+// Logging
+pub use logging::{init_logging, LogGuard};
 //
 // Import the types that every downstream crate will use most often directly
 // from `kb_core::` rather than `kb_core::types::`.
