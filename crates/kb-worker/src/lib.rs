@@ -16,3 +16,6 @@ pub use parser::{parse_processor_output, ParseError};
 
 // Re-export the processor contract types at the crate root for convenience.
 pub use processor::{invoke_processor, ProcessorError, ProcessorOutput};
+
+// Re-export output validation at the crate root for convenience.
+pub use validate::{validate_processor_outputs, ValidationError};

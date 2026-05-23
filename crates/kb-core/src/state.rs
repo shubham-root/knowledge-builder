@@ -1572,4 +1572,383 @@ mod tests {
         let updated = store.get_file_by_id(row.id).await.unwrap().unwrap();
         assert_eq!(updated.status, Status::Queued);
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // process_stable_file tests (§3.3 five-rule dedup)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Convenience: set up a file that is fully done with the given hash.
+    async fn make_done_file(store: &StateStore, path: PathBuf, hash: &str) -> FileRow {
+        let row = store
+            .register_seen(path, Some(512), None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, hash.into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        store.claim_next().await.unwrap().expect("should claim");
+        store.mark_done(row.id, vec![], None).await.unwrap();
+        store.get_file_by_id(row.id).await.unwrap().unwrap()
+    }
+
+    // ─ Rule 5: brand-new path → Queued ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn psf_rule5_new_path_is_queued() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/new.pdf");
+
+        let outcome = store
+            .process_stable_file(path.clone(), 1024, 1_700_000_000_000, 42, "sha256:new1".into())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::Queued);
+
+        let row = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(row.status, Status::Queued);
+        assert_eq!(row.content_hash.as_deref(), Some("sha256:new1"));
+        assert_eq!(row.size, Some(1024));
+        assert_eq!(row.inode, Some(42));
+    }
+
+    // ─ Rule 5 (audit): queued outcome emits a 'queued' event ───────────────
+
+    #[tokio::test]
+    async fn psf_rule5_queued_records_audit_event() {
+        let store = open_test_store().await;
+
+        store
+            .process_stable_file(
+                PathBuf::from("/vault/sources/evtnew.pdf"),
+                512, 0, 1, "sha256:evtnew".into(),
+            )
+            .await
+            .unwrap();
+
+        let events = store
+            .get_events(None, None, Some("queued".into()), 10)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "expected a 'queued' audit event");
+        assert!(events[0].message.contains("evtnew.pdf"));
+    }
+
+    // ─ Rule 1: done + same hash → AlreadyDone ────────────────────────────
+
+    #[tokio::test]
+    async fn psf_rule1_already_done_same_hash() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/done_same.pdf");
+        let hash  = "sha256:done1";
+        make_done_file(&store, path.clone(), hash).await;
+
+        let outcome = store
+            .process_stable_file(path.clone(), 512, 0, 1, hash.into())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::AlreadyDone);
+
+        // DB must be unchanged.
+        let row = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(row.status, Status::Done, "status must remain Done");
+    }
+
+    // ─ Rule 2: done + different hash → RequeuedRevision ───────────────────
+
+    #[tokio::test]
+    async fn psf_rule2_done_different_hash_requeued() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/done_diff.pdf");
+        let row   = make_done_file(&store, path.clone(), "sha256:v1").await;
+        assert_eq!(row.status, Status::Done);
+
+        let outcome = store
+            .process_stable_file(path.clone(), 999, 0, 7, "sha256:v2".into())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::RequeuedRevision);
+
+        let updated = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Queued);
+        assert_eq!(updated.content_hash.as_deref(), Some("sha256:v2"), "hash must be updated");
+        assert_eq!(updated.size, Some(999),  "size must be updated");
+        assert_eq!(updated.inode, Some(7),   "inode must be updated");
+    }
+
+    // ─ Rule 2 (audit): revision emits a 'queued' event ───────────────────
+
+    #[tokio::test]
+    async fn psf_rule2_revision_records_audit_event() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/rev_evt.pdf");
+        make_done_file(&store, path.clone(), "sha256:rv1").await;
+
+        store
+            .process_stable_file(path.clone(), 100, 0, 1, "sha256:rv2".into())
+            .await
+            .unwrap();
+
+        let events = store
+            .get_events(None, None, Some("queued".into()), 20)
+            .await
+            .unwrap();
+        // The revision should have produced a 'queued' event whose message
+        // contains "requeued revision".
+        let revision_evt = events
+            .iter()
+            .find(|e| e.message.contains("requeued revision"));
+        assert!(revision_evt.is_some(), "expected 'requeued revision' audit event");
+    }
+
+    // ─ Rule 3: other row with same hash is done → SkippedDuplicate ────────
+
+    #[tokio::test]
+    async fn psf_rule3_duplicate_hash_skipped() {
+        let store = open_test_store().await;
+        let hash  = "sha256:dup_test";
+
+        // First path: fully processed.
+        make_done_file(&store, PathBuf::from("/vault/sources/dup_a.pdf"), hash).await;
+
+        // Second path: same content hash.
+        let outcome = store
+            .process_stable_file(
+                PathBuf::from("/vault/sources/dup_b.pdf"),
+                512, 0, 2, hash.into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::SkippedDuplicate);
+
+        let row = store
+            .find_by_path(PathBuf::from("/vault/sources/dup_b.pdf"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, Status::Skipped);
+    }
+
+    // ─ Rule 3 (audit): skip emits a 'skipped_duplicate' event ───────────
+
+    #[tokio::test]
+    async fn psf_rule3_skip_records_audit_event() {
+        let store = open_test_store().await;
+        let hash  = "sha256:skipdupevt";
+        make_done_file(&store, PathBuf::from("/vault/sources/sdupevt_a.pdf"), hash).await;
+
+        store
+            .process_stable_file(
+                PathBuf::from("/vault/sources/sdupevt_b.pdf"),
+                512, 0, 3, hash.into(),
+            )
+            .await
+            .unwrap();
+
+        let events = store
+            .get_events(None, None, Some("skipped_duplicate".into()), 10)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "expected a 'skipped_duplicate' audit event");
+    }
+
+    // ─ Rule 4: queued status → AlreadyPending ───────────────────────────
+
+    #[tokio::test]
+    async fn psf_rule4_already_queued_noop() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/inqueue.pdf");
+        let hash  = "sha256:inq1";
+
+        // First call: queues the file.
+        let first = store
+            .process_stable_file(path.clone(), 100, 0, 1, hash.into())
+            .await
+            .unwrap();
+        assert_eq!(first, EnqueueOutcome::Queued);
+
+        // Second call: must be a no-op.
+        let second = store
+            .process_stable_file(path.clone(), 100, 0, 1, hash.into())
+            .await
+            .unwrap();
+        assert_eq!(second, EnqueueOutcome::AlreadyPending);
+
+        // Status must be unchanged.
+        let row = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(row.status, Status::Queued);
+    }
+
+    // ─ Rule 4: processing status → AlreadyPending ───────────────────────
+
+    #[tokio::test]
+    async fn psf_rule4_already_processing_noop() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/inproc.pdf");
+        let hash  = "sha256:inp1";
+
+        // Use the lower-level API to put the row into 'processing'.
+        let row = store
+            .register_seen(path.clone(), Some(100), None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, hash.into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        store.claim_next().await.unwrap().expect("should claim");
+
+        let outcome = store
+            .process_stable_file(path.clone(), 100, 0, 1, hash.into())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::AlreadyPending);
+
+        let updated = store.get_file_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Processing, "must remain Processing");
+    }
+
+    // ─ Rule 3 fires BEFORE rule 4 (queued row but dup done → SkippedDuplicate) ─
+
+    #[tokio::test]
+    async fn psf_rule3_fires_before_rule4() {
+        let store = open_test_store().await;
+        let hash  = "sha256:r3r4_order";
+
+        // File A: fully done.
+        make_done_file(&store, PathBuf::from("/vault/sources/order_a.pdf"), hash).await;
+
+        // File B: queue it via lower-level API so it is in 'queued' state.
+        let rb = store
+            .register_seen(PathBuf::from("/vault/sources/order_b.pdf"), None, None, None)
+            .await
+            .unwrap();
+        store.set_hash(rb.id, hash.into()).await.unwrap();
+        store.enqueue(rb.id).await.unwrap(); // status = queued
+
+        // Now call process_stable_file on File B.
+        // Rule 3 (dup done) fires before Rule 4 (already queued) → SkippedDuplicate.
+        let outcome = store
+            .process_stable_file(
+                PathBuf::from("/vault/sources/order_b.pdf"),
+                100, 0, 2, hash.into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            EnqueueOutcome::SkippedDuplicate,
+            "rule 3 must fire before rule 4",
+        );
+        let rb_updated = store.get_file_by_id(rb.id).await.unwrap().unwrap();
+        assert_eq!(rb_updated.status, Status::Skipped);
+    }
+
+    // ─ Rule 5: existing 'seen' row (from register_seen) → Queued ─────────
+
+    #[tokio::test]
+    async fn psf_rule5_existing_seen_becomes_queued() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/preseen.pdf");
+
+        // Pre-register without a hash (simulates a detect-before-stable scenario).
+        let row = store
+            .register_seen(path.clone(), Some(200), None, None)
+            .await
+            .unwrap();
+        assert_eq!(row.status, Status::Seen);
+
+        let outcome = store
+            .process_stable_file(path.clone(), 200, 1_000, 5, "sha256:seen1".into())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EnqueueOutcome::Queued);
+        let updated = store.get_file_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Queued);
+        assert_eq!(updated.content_hash.as_deref(), Some("sha256:seen1"));
+    }
+
+    // ─ Rule 5: previously-failed row → Queued ────────────────────────────
+
+    #[tokio::test]
+    async fn psf_rule5_failed_row_requeued() {
+        // Use an empty backoff so the first retryable failure is terminal.
+        let dir   = tempfile::tempdir().unwrap();
+        let db    = dir.path().join("psf_failed.db");
+        let store = StateStore::new(&db, &[]).await.unwrap();
+        Box::leak(Box::new(dir));
+
+        let path = PathBuf::from("/vault/sources/failed_file.pdf");
+        let row  = store
+            .register_seen(path.clone(), None, None, None)
+            .await
+            .unwrap();
+        store.set_hash(row.id, "sha256:fail1".into()).await.unwrap();
+        store.enqueue(row.id).await.unwrap();
+        store.claim_next().await.unwrap().expect("should claim");
+        store.mark_failed(row.id, "transient".into(), false).await.unwrap();
+
+        let failed = store.get_file_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(failed.status, Status::Failed);
+
+        // Re-encounter with same hash still re-queues (rule 5).
+        let outcome = store
+            .process_stable_file(path.clone(), 100, 0, 1, "sha256:fail1".into())
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnqueueOutcome::Queued);
+
+        let updated = store.get_file_by_id(row.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, Status::Queued);
+    }
+
+    // ─ Atomicity: row update and audit event both visible after commit ─────
+
+    #[tokio::test]
+    async fn psf_atomicity_row_and_event_together() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/atomic.pdf");
+
+        let outcome = store
+            .process_stable_file(path.clone(), 100, 0, 1, "sha256:atom".into())
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnqueueOutcome::Queued);
+
+        // Both the row and the event must exist.
+        let row = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(row.status, Status::Queued);
+
+        let events = store
+            .get_events(None, None, Some("queued".into()), 10)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "audit event must be recorded");
+        assert_eq!(
+            events[0].file_id,
+            Some(row.id),
+            "audit event must reference the correct file_id",
+        );
+    }
+
+    // ─ Metadata fields updated on every state-changing call ───────────────
+
+    #[tokio::test]
+    async fn psf_metadata_fields_updated() {
+        let store = open_test_store().await;
+        let path  = PathBuf::from("/vault/sources/meta.pdf");
+
+        store
+            .process_stable_file(path.clone(), 111, 222_000, 33, "sha256:meta1".into())
+            .await
+            .unwrap();
+
+        let row = store.find_by_path(path).await.unwrap().unwrap();
+        assert_eq!(row.size,     Some(111));
+        assert_eq!(row.mtime_ns, Some(222_000));
+        assert_eq!(row.inode,    Some(33));
+    }
 }
