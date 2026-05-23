@@ -20,3 +20,9 @@ anyhow    = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+# Unix signal constants (SIGTERM, SIGKILL, killpg)
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

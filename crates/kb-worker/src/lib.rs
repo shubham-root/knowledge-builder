@@ -8,3 +8,6 @@
 pub mod pool;
 pub mod processor;
 pub mod validate;
+
+// Re-export the processor contract types at the crate root for convenience.
+pub use processor::{invoke_processor, ProcessorError, ProcessorOutput};
