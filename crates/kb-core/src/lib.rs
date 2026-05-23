@@ -75,8 +75,10 @@ pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 // ── State store re-export ────────────────────────────────────────────────────
 //
 // The actor handle is available as `kb_core::StateStore` so downstream crates
-// need only one import.
+// need only one import.  `broadcast` is re-exported so callers can wire up
+// SSE broadcasters without importing tokio directly.
 pub use state::StateStore;
+pub use tokio::sync::broadcast;
 
 // ── Migrations re-export ─────────────────────────────────────────────────────
 pub use migrations::{db_open, run_migrations};

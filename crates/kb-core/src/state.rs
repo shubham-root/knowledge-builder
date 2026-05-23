@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Row;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::migrations;
 use crate::types::{
@@ -140,6 +140,25 @@ pub enum StateOp {
         kind:  Option<String>,
         limit: i64,
         reply: oneshot::Sender<crate::Result<Vec<AuditEvent>>>,
+    },
+
+    /// Register (or replace) the broadcast channel used to push live
+    /// [`AuditEvent`]s to SSE subscribers immediately after every
+    /// `INSERT INTO events` statement.
+    SetEventBroadcaster {
+        sender: broadcast::Sender<AuditEvent>,
+        reply:  oneshot::Sender<crate::Result<()>>,
+    },
+
+    /// Return events whose `id` is strictly greater than `after_id`,
+    /// ordered oldest-first.  Used by the SSE catchup phase when a client
+    /// reconnects with a `Last-Event-ID` header.
+    GetEventsAfterID {
+        after_id: i64,
+        level:    Option<String>,
+        kind:     Option<String>,
+        limit:    i64,
+        reply:    oneshot::Sender<crate::Result<Vec<AuditEvent>>>,
     },
 
     /// Manually requeue a file: reset status → `queued`, attempts → 0,
@@ -478,6 +497,50 @@ impl StateStore {
         .await
     }
 
+    /// Register a broadcast channel so that every newly-recorded
+    /// [`AuditEvent`] is also sent to SSE subscribers in real time.
+    ///
+    /// Call this once during daemon startup, before the HTTP server accepts
+    /// connections.  Subsequent calls replace the previous broadcaster.
+    ///
+    /// The `sender` is a [`tokio::sync::broadcast::Sender<AuditEvent>`];
+    /// obtain it via [`crate::EventBroadcaster::sender()`] or by calling
+    /// [`tokio::sync::broadcast::channel`] directly.
+    pub async fn set_event_broadcaster(
+        &self,
+        sender: broadcast::Sender<AuditEvent>,
+    ) -> crate::Result<()> {
+        self.send(|reply| StateOp::SetEventBroadcaster { sender, reply })
+            .await
+    }
+
+    /// Return audit events with `id` strictly greater than `after_id`,
+    /// ordered **oldest-first** (ascending `id`).
+    ///
+    /// This is the primitive used by the SSE `/tail` handler to replay events
+    /// the client missed during a disconnect (the `Last-Event-ID` header).
+    ///
+    /// - `after_id` — only return rows with `id > after_id`.
+    /// - `level`    — optional level filter (`"info"`, `"warn"`, `"error"`).
+    /// - `kind`     — optional kind filter (see [`crate::event_kind`]).
+    /// - `limit`    — maximum rows to return.
+    pub async fn get_events_after_id(
+        &self,
+        after_id: i64,
+        level:    Option<String>,
+        kind:     Option<String>,
+        limit:    i64,
+    ) -> crate::Result<Vec<AuditEvent>> {
+        self.send(|reply| StateOp::GetEventsAfterID {
+            after_id,
+            level,
+            kind,
+            limit,
+            reply,
+        })
+        .await
+    }
+
     /// Atomically apply the §3.3 five-rule dedup + enqueue logic for a
     /// freshly-stabilised file.
     ///
@@ -601,13 +664,18 @@ impl StateStore {
 /// `mpsc` receiver.  This eliminates all `SQLITE_BUSY` contention and makes
 /// every operation conceptually `O(1)` from the caller's perspective.
 struct StateActor {
-    conn:         rusqlite::Connection,
-    backoff_secs: Vec<u64>,
+    conn:              rusqlite::Connection,
+    backoff_secs:      Vec<u64>,
+    /// Optional broadcast channel; receives a clone of every newly-inserted
+    /// [`AuditEvent`].  `None` until [`StateOp::SetEventBroadcaster`] is
+    /// processed.  `broadcast::Sender::send` is synchronous and safe to call
+    /// from this non-async OS thread.
+    event_broadcaster: Option<broadcast::Sender<AuditEvent>>,
 }
 
 impl StateActor {
     fn new(conn: rusqlite::Connection, backoff_secs: Vec<u64>) -> Self {
-        Self { conn, backoff_secs }
+        Self { conn, backoff_secs, event_broadcaster: None }
     }
 
     /// Drive the actor loop until the sender side of the channel is dropped.
@@ -670,6 +738,13 @@ impl StateActor {
             }
             StateOp::GetEvents { since, level, kind, limit, reply } => {
                 let _ = reply.send(self.get_events(since, level, kind, limit));
+            }
+            StateOp::SetEventBroadcaster { sender, reply } => {
+                self.event_broadcaster = Some(sender);
+                let _ = reply.send(Ok(()));
+            }
+            StateOp::GetEventsAfterID { after_id, level, kind, limit, reply } => {
+                let _ = reply.send(self.get_events_after_id_op(after_id, level, kind, limit));
             }
             StateOp::Requeue { id, reply } => {
                 let _ = reply.send(self.requeue_op(id));
@@ -1549,6 +1624,11 @@ impl StateActor {
 
     /// Synchronous `record_event` used internally by the actor itself
     /// (e.g., from within [`recover_in_flight`]).
+    ///
+    /// After inserting the row, the newly-created [`AuditEvent`] is broadcast
+    /// to any registered SSE subscribers via the optional
+    /// `event_broadcaster`.  Errors from the broadcast (e.g. no receivers)
+    /// are silently ignored.
     fn record_event_op(
         &self,
         level:   &str,
@@ -1563,7 +1643,57 @@ impl StateActor {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![now, level, kind, file_id, message, detail],
         )?;
+
+        // Broadcast to SSE subscribers (if any are registered).
+        // `broadcast::Sender::send` is infallible from this OS thread.
+        if let Some(tx) = &self.event_broadcaster {
+            let id = self.conn.last_insert_rowid();
+            let event = AuditEvent {
+                id,
+                ts:      now,
+                level:   level.to_owned(),
+                kind:    kind.to_owned(),
+                file_id,
+                message: message.to_owned(),
+                detail:  detail.map(|s| s.to_owned()),
+            };
+            let _ = tx.send(event); // ignore RecvError::NoReceivers
+        }
+
         Ok(())
+    }
+
+    /// Return events with `id > after_id`, ordered oldest-first.
+    /// Used for SSE catchup when a client reconnects.
+    fn get_events_after_id_op(
+        &self,
+        after_id: i64,
+        level:    Option<String>,
+        kind:     Option<String>,
+        limit:    i64,
+    ) -> crate::Result<Vec<AuditEvent>> {
+        let sql = "SELECT id, ts, level, kind, file_id, message, detail \
+                   FROM events \
+                   WHERE id > ?1 \
+                     AND (?2 IS NULL OR level = ?2) \
+                     AND (?3 IS NULL OR kind  = ?3) \
+                   ORDER BY id ASC \
+                   LIMIT ?4";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![after_id, level, kind, limit], |row| {
+                Ok(AuditEvent {
+                    id:      row.get(0)?,
+                    ts:      row.get(1)?,
+                    level:   row.get(2)?,
+                    kind:    row.get(3)?,
+                    file_id: row.get(4)?,
+                    message: row.get(5)?,
+                    detail:  row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     fn list_files(

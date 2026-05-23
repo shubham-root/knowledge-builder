@@ -928,11 +928,12 @@ mod tests {
 
         // Seed a file row via StateStore directly.
         let path = PathBuf::from("/tmp/test_vault/sources/doc.pdf");
-        let file_id = state
+        let file_row = state
             .state_store
             .register_seen(path.clone(), None, None, None)
             .await
             .expect("register_seen");
+        let file_id: i64 = file_row.id;
 
         // ── GET /files should return 1 row ──
         let app = router(state.clone());
