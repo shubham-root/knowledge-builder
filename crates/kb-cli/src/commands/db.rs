@@ -130,3 +130,78 @@ pub fn short_hash(hash: &str) -> String {
         }
     }
 }
+
+// ── Target resolution (shared by show, requeue, reset) ───────────────────────────
+
+/// Resolve a `<path|id>` CLI argument to a [`FileRow`].
+///
+/// Resolution strategy (in order):
+/// 1. If `target` parses as a **positive integer** → look up by ID.
+/// 2. Otherwise treat as a **path**:
+///    a. Expand a leading `~` to the home directory.
+///    b. Make absolute (prepend `cwd` if the path is relative).
+///    c. Look up in the DB by the resulting path string.
+///    d. If not found, also try `std::fs::canonicalize` in case the stored
+///       path went through symlink resolution.
+///
+/// Returns a human-friendly error if nothing matches.
+pub async fn resolve_target(store: &StateStore, target: &str) -> Result<FileRow> {
+    // ── Numeric ID first ──────────────────────────────────────────────────────────────
+    if let Ok(id) = target.parse::<i64>() {
+        if id > 0 {
+            return match store.get_file_by_id(id).await? {
+                Some(row) => Ok(row),
+                None => bail!(
+                    "no file found with ID {id}. \
+                     Use `kb list` to see all tracked files."
+                ),
+            };
+        }
+    }
+
+    // ── Path lookup ───────────────────────────────────────────────────────────────────
+    let expanded = expand_tilde(target);
+    let path = if expanded.is_absolute() {
+        expanded.clone()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&expanded)
+    };
+
+    // First attempt: as-is (may already be the canonical stored path).
+    if let Some(row) = store.find_by_path(path.clone()).await? {
+        return Ok(row);
+    }
+
+    // Second attempt: canonicalize (resolves `.` / `..` / symlinks) and retry.
+    if let Ok(canon) = std::fs::canonicalize(&path) {
+        if canon != path {
+            if let Some(row) = store.find_by_path(canon).await? {
+                return Ok(row);
+            }
+        }
+    }
+
+    bail!(
+        "no file found for '{target}'. \
+         Use `kb list` to see all tracked files, or provide a numeric ID."
+    )
+}
+
+/// Expand a leading `~` in `s` to the user’s home directory.
+///
+/// Returns a [`PathBuf`] with the substitution applied, or the original path
+/// unchanged if it does not start with `~`.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(s)
+}

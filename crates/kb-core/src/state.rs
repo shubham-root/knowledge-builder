@@ -213,6 +213,14 @@ pub struct StateStore {
     sender: mpsc::Sender<StateOp>,
 }
 
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateStore")
+            .field("channel_capacity", &self.sender.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
 impl StateStore {
     /// Open (or create) the database at `db_path`, run all pending migrations,
     /// and start the background actor thread.
@@ -559,6 +567,38 @@ impl StateStore {
     pub async fn reset_file(&self, id: i64) -> crate::Result<(PathBuf, usize)> {
         self.send(|reply| StateOp::ResetFile { id, reply }).await
     }
+
+    /// Prune file rows (and their cascade-deleted outputs) matching the given
+    /// status and optional `before` date cutoff.
+    ///
+    /// # Arguments
+    /// - `before_ts` — Unix epoch-second cutoff; only rows with
+    ///   `updated_at < before_ts` are considered.  Pass `None` to include all.
+    /// - `status`    — only rows with this exact status are pruned.
+    /// - `dry_run`   — when `true`, counts and collects rows but makes no
+    ///   DB changes.
+    ///
+    /// # Returns
+    /// A [`PruneResult`] with file/output counts and, in dry-run mode, the
+    /// rows that would be pruned.
+    pub async fn prune_files(
+        &self,
+        before_ts: Option<i64>,
+        status:    Status,
+        dry_run:   bool,
+    ) -> crate::Result<PruneResult> {
+        self.send(|reply| StateOp::PruneFiles { before_ts, status, dry_run, reply })
+            .await
+    }
+
+    /// Return aggregated storage statistics for `kb storage`.
+    ///
+    /// Aggregates:
+    /// - Source bytes grouped by file extension (from the `files` table).
+    /// - Output bytes grouped by kind (from the `outputs` table).
+    pub async fn get_storage_stats(&self) -> crate::Result<StorageStats> {
+        self.send(|reply| StateOp::GetStorageStats { reply }).await
+    }
 }
 
 // ─── StateActor ───────────────────────────────────────────────────────────────
@@ -649,6 +689,12 @@ impl StateActor {
                 let _ = reply.send(
                     self.process_stable_file_op(path, size, mtime_ns, inode, content_hash),
                 );
+            }
+            StateOp::PruneFiles { before_ts, status, dry_run, reply } => {
+                let _ = reply.send(self.prune_files_op(before_ts, status, dry_run));
+            }
+            StateOp::GetStorageStats { reply } => {
+                let _ = reply.send(self.get_storage_stats_op());
             }
         }
     }
@@ -928,6 +974,139 @@ impl StateActor {
         );
 
         Ok((path, output_count))
+    }
+
+    /// Prune file rows (and cascade-deleted outputs) matching status + date
+    /// filter.  On `dry_run = true` returns counts/rows but writes nothing.
+    fn prune_files_op(
+        &self,
+        before_ts: Option<i64>,
+        status:    Status,
+        dry_run:   bool,
+    ) -> crate::Result<PruneResult> {
+        let status_str = status.as_str().to_owned();
+
+        // ── 1. Fetch matching rows ────────────────────────────────────────────
+        let file_sql = format!(
+            "SELECT {cols} FROM files \
+             WHERE status = ?1 \
+               AND (?2 IS NULL OR updated_at < ?2) \
+             ORDER BY updated_at ASC",
+            cols = Self::FILE_COLS,
+        );
+        let mut stmt = self.conn.prepare(&file_sql)?;
+        let files: Vec<FileRow> = stmt
+            .query_map(rusqlite::params![status_str, before_ts], |r| {
+                Self::map_file_row(r)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let file_count = files.len();
+        if file_count == 0 {
+            return Ok(PruneResult::default());
+        }
+
+        // ── 2. Count cascading outputs (via subquery — no dynamic IN clause) ──
+        let output_count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM outputs \
+             WHERE source_id IN ( \
+                 SELECT id FROM files \
+                 WHERE status = ?1 AND (?2 IS NULL OR updated_at < ?2) \
+             )",
+            rusqlite::params![status_str, before_ts],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+
+        // ── 3. Dry-run: return preview without touching the DB ────────────────
+        if dry_run {
+            return Ok(PruneResult { file_count, output_count, files });
+        }
+
+        // ── 4. Delete matching rows (outputs cascade via FK) ─────────────────
+        self.conn.execute(
+            "DELETE FROM files \
+             WHERE status = ?1 AND (?2 IS NULL OR updated_at < ?2)",
+            rusqlite::params![status_str, before_ts],
+        )?;
+
+        tracing::info!(
+            file_count   = file_count,
+            output_count = output_count,
+            status       = %status,
+            "Pruned {file_count} file record(s) and {output_count} output record(s)",
+        );
+
+        Ok(PruneResult { file_count, output_count, files: vec![] })
+    }
+
+    /// Aggregate storage statistics: source bytes by extension, output bytes
+    /// by kind.
+    fn get_storage_stats_op(&self) -> crate::Result<StorageStats> {
+        use std::collections::HashMap;
+
+        // ── 1. Aggregate source files by extension in application code ────────
+        //
+        // SQLite has no reliable "last component after final dot" function;
+        // extracting the extension in Rust is cleaner and easier to test.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, COALESCE(size, 0) FROM files")?;
+        let path_rows: Vec<(String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let total_source_count = path_rows.len() as i64;
+
+        // Group by lowercase extension.
+        let mut ext_map: HashMap<String, (i64, i64)> = HashMap::new();
+        for (path_str, size) in &path_rows {
+            let ext = std::path::Path::new(path_str)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_else(|| "(none)".into());
+            let entry = ext_map.entry(ext).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += size;
+        }
+
+        let mut by_ext: Vec<ExtStat> = ext_map
+            .into_iter()
+            .map(|(ext, (count, bytes))| ExtStat { ext, count, bytes })
+            .collect();
+        // Sort largest-first, then alphabetically as a tiebreaker.
+        by_ext.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.ext.cmp(&b.ext)));
+
+        // ── 2. Aggregate outputs by kind (pure SQL — `kind` is already a
+        //       structured string, no extension parsing needed) ────────────────
+        let mut stmt2 = self.conn.prepare(
+            "SELECT COALESCE(kind, '(none)'), COUNT(*), SUM(COALESCE(bytes, 0)) \
+             FROM outputs \
+             GROUP BY kind \
+             ORDER BY SUM(COALESCE(bytes, 0)) DESC",
+        )?;
+        let by_kind: Vec<KindStat> = stmt2
+            .query_map([], |row| {
+                Ok(KindStat {
+                    kind:  row.get(0)?,
+                    count: row.get(1)?,
+                    bytes: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let total_output_count: i64 = by_kind.iter().map(|k| k.count).sum();
+        let source_bytes: i64       = by_ext.iter().map(|e| e.bytes).sum();
+        let output_bytes: i64       = by_kind.iter().map(|k| k.bytes).sum();
+        let total_bytes             = source_bytes + output_bytes;
+
+        Ok(StorageStats {
+            by_ext,
+            by_kind,
+            total_source_count,
+            total_output_count,
+            total_bytes,
+        })
     }
 
     /// Implements §3.3 dedup rules 1-5 atomically in a single transaction.
