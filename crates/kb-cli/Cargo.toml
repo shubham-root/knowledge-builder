@@ -40,3 +40,6 @@ tracing = { workspace = true }
 
 # Terminal colors
 colored = { workspace = true }
+
+# UID lookup (install/uninstall)
+libc = { workspace = true }

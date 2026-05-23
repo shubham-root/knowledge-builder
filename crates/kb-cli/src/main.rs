@@ -71,7 +71,7 @@ enum Commands {
     Storage,
 
     /// Register the daemon as a launchd LaunchAgent.
-    Install,
+    Install(commands::install::InstallArgs),
 
     /// Remove the launchd LaunchAgent registration.
     Uninstall,
@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
         Commands::Tail(args)     => commands::tail::run(args).await,
         Commands::Prune(args)    => commands::prune::run(args).await,
         Commands::Storage        => commands::storage::run().await,
-        Commands::Install        => commands::install::run().await,
+        Commands::Install(args)  => commands::install::run(args).await,
         Commands::Uninstall      => commands::uninstall::run().await,
         Commands::Config(args)   => commands::config::run(args).await,
         Commands::Doctor         => commands::doctor::run().await,
