@@ -347,9 +347,11 @@ async fn scenario_07_symlink_escape_rejected() {
 /// Overall test budget: 30 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_08_processor_timeout_retried() {
-    let vault = TestVault::new().await.unwrap();
+    // Use backoff_secs=[2] in the state store → 2 total attempts → terminal
+    // after the second timeout cycle.
+    let vault = TestVault::with_backoffs(&[2_u64]).await.unwrap();
     let shutdown = CancellationToken::new();
-    // max_attempts = 2 (backoff_secs.len() + 1), backoff = 2 s.
+    // Config backoffs must match state store backoffs.  max_attempts = 2.
     let config =
         vault.make_config(&stub_path("run_timeout.sh"), 2, 300, vec![2_u64], 1);
     let _pool_handle = vault.start_worker_pool(&config, shutdown.clone());

@@ -93,7 +93,17 @@ pub struct TestVault {
 
 impl TestVault {
     /// Create a new, isolated test vault with its own temp directory and DB.
+    /// Uses default short backoffs `[1, 2, 5]`.
     pub async fn new() -> Result<Self> {
+        Self::with_backoffs(&[1_u64, 2_u64, 5_u64]).await
+    }
+
+    /// Create a vault with custom backoff schedule.
+    ///
+    /// The backoff schedule is owned by the `StateStore` actor and drives
+    /// `mark_failed` retry logic.  Length determines max attempts:
+    /// `max_attempts = backoff_secs.len() + 1`.
+    pub async fn with_backoffs(backoffs: &[u64]) -> Result<Self> {
         // Prefix must NOT start with '.' — the scanner's dotfile filter would
         // reject all paths inside a dot-prefixed TempDir.
         let dir = tempfile::Builder::new()
@@ -111,8 +121,7 @@ impl TestVault {
         std::fs::create_dir_all(&notes_dir).context("create notes_dir")?;
         std::fs::create_dir_all(&work_dir_root).context("create work_dir_root")?;
 
-        // Short backoffs for fast retry tests.
-        let store = StateStore::new(&db_path, &[1_u64, 2_u64, 5_u64])
+        let store = StateStore::new(&db_path, backoffs)
             .await
             .context("open state store")?;
 
