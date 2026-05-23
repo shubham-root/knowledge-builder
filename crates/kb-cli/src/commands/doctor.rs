@@ -49,35 +49,35 @@ pub async fn run() -> Result<()> {
     }
 
     // ── Step 3: SQLite integrity check (only if DB file already exists) ───────
-    let db_path = std::path::Path::new(&config.paths.db_path);
+    let db_path_str = config.paths.db_path.clone();
+    let db_path     = std::path::PathBuf::from(&db_path_str);
     if db_path.exists() {
-        match kb_core::state::StateStore::open(db_path) {
-            Ok(store) => {
-                match store
-                    .connection()
-                    .query_row("PRAGMA integrity_check", [], |row| {
-                        row.get::<_, String>(0)
-                    }) {
-                    Ok(result) if result == "ok" => {
-                        checker.pass("SQLite integrity check passed.");
-                    }
-                    Ok(result) => {
-                        checker.fail(format!(
-                            "SQLite integrity check failed: {result}\n\
-                             \t   Backup the DB immediately; consider `VACUUM INTO backup.db`."
-                        ));
-                    }
-                    Err(e) => {
-                        checker.fail(format!("SQLite integrity check error: {e}"));
-                    }
-                }
+        let check_result = tokio::task::spawn_blocking(move || {
+            let conn   = kb_core::migrations::db_open(&db_path)?;
+            let result: String =
+                conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            Ok::<String, anyhow::Error>(result)
+        })
+        .await;
+
+        match check_result {
+            Ok(Ok(ref s)) if s == "ok" => {
+                checker.pass("SQLite integrity check passed.");
+            }
+            Ok(Ok(ref s)) => {
+                checker.fail(format!(
+                    "SQLite integrity check failed: {s}\n\
+                     \t   Backup the DB immediately; consider `VACUUM INTO backup.db`."
+                ));
+            }
+            Ok(Err(e)) => {
+                checker.fail(format!(
+                    "Cannot open database '{db_path_str}': {e}\n\
+                     \t   Ensure the path is writable and not locked by another process."
+                ));
             }
             Err(e) => {
-                checker.fail(format!(
-                    "Cannot open database '{}': {e}\n\
-                     \t   Ensure the path is writable and not locked by another process.",
-                    config.paths.db_path
-                ));
+                checker.fail(format!("SQLite integrity check task panicked: {e}"));
             }
         }
     } else {

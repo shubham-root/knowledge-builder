@@ -62,6 +62,15 @@ pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 // The most-used config surface is available directly from `kb_core::` so
 // callers can write `kb_core::Config::load()` without the full module path.
 
+// ── State store re-export ────────────────────────────────────────────────────
+//
+// The actor handle is available as `kb_core::StateStore` so downstream crates
+// need only one import.
+pub use state::StateStore;
+
+// ── Migrations re-export ─────────────────────────────────────────────────────
+pub use migrations::{db_open, run_migrations};
+
 pub use config::{
     Config,
     ConfigError,
