@@ -143,11 +143,8 @@ impl WorkerPool {
     /// to wait for the loop to exit cleanly after shutdown.
     pub fn run(self) -> JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!(
-                concurrency = self.semaphore.available_permits()
-                    + (self.semaphore.available_permits() ^ self.semaphore.available_permits()), // keep borrow checker happy
-                "worker pool started",
-            );
+            let concurrency = self.semaphore.available_permits();
+            tracing::info!(concurrency, "worker pool started");
 
             loop {
                 // ── Check for shutdown before doing any work ──────────────

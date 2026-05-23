@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Unique label identifying this LaunchAgent to launchd -->
+    <key>Label</key>
+    <string>com.user.knowledge-builder</string>
+
+    <!-- The binary and its subcommand -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{KB_BIN}}</string>
+        <string>daemon</string>
+    </array>
+
+    <!-- Start the daemon immediately when the agent is loaded (login / launchctl bootstrap) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash (SuccessfulExit = false), but do NOT restart on clean exit -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Minimum seconds between successive restarts to prevent tight crash-loops -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Working directory for the process -->
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}</string>
+
+    <!-- Redirect stdout / stderr to persistent log files -->
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/stderr.log</string>
+
+    <!-- Runtime environment: ensure common binary locations are on PATH for
+         subprocesses (Python processor, system tools) on both Intel and Apple Silicon -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Background process type: eligible for reduced scheduling priority -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Reduce I/O priority so vault writes never compete with foreground apps -->
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <!-- Nice value: +5 lowers CPU scheduling priority (0 = normal, 20 = lowest) -->
+    <key>Nice</key>
+    <integer>5</integer>
+
+</dict>
+</plist>
