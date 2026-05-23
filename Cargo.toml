@@ -70,6 +70,7 @@ futures-util     = { version = "0.3", default-features = false, features = ["std
 
 # Testing utilities
 tempfile   = { version = "3" }
+proptest   = { version = "1" }
 
 # Inter-crate dependencies
 kb-core    = { path = "crates/kb-core" }
