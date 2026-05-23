@@ -366,7 +366,6 @@ fn kill_process_group(pgid: i32, signal: libc::c_int) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use kb_core::types::{ProcessOutput, ProcessResult};
 
     fn make_input() -> ProcessorInput {
         ProcessorInput {
