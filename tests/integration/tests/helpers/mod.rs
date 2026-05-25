@@ -285,6 +285,7 @@ impl TestVault {
                 log_level:  "info".into(),
                 log_format: "json".into(),
             },
+            extraction: kb_core::config::ExtractionConfig::default(),
         }
     }
 

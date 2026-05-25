@@ -1,0 +1,55 @@
+[package]
+name        = "kb-extractor"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Document → Markdown extraction for Knowledge Builder, powered by transmutation."
+
+[features]
+# Default build = pure-Rust fast + precision modes only.  No external native
+# libs beyond what transmutation's own pdf-to-image / image-ocr features pull
+# in (poppler / tesseract — both expected to be on PATH on macOS).
+default      = ["pdf-to-image", "image-ocr", "office"]
+
+# Forwards to transmutation's `office` feature: enables docx-rs +
+# umya-spreadsheet for DOCX/XLSX/PPTX extraction (pure Rust).
+office       = ["transmutation/office"]
+
+# Forwards to transmutation's `pdf-to-image` feature: enables per-page
+# PDF rendering via libpdfium.  Needed for image preview generation.
+pdf-to-image = ["transmutation/pdf-to-image"]
+
+# Forwards to transmutation's `image-ocr` feature: enables Tesseract OCR
+# for JPG/PNG/TIFF/BMP/GIF/WEBP inputs.
+image-ocr    = ["transmutation/image-ocr"]
+
+# Opt-in: docling-parse C++ FFI via ONNX Runtime.  Adds ~60 MB to the
+# binary and a slower first-run model load, but reaches ~98% similarity
+# on academic PDFs.  Surface in kb config as `extraction.default_mode = "ffi"`.
+docling-ffi  = ["transmutation/docling-ffi"]
+
+[dependencies]
+# Workspace
+kb-core      = { path = "../kb-core" }
+
+# transmutation drives all format conversions.  We pin to 0.3.x to follow
+# the API surface documented at https://crates.io/crates/transmutation/0.3.2
+transmutation = { version = "0.3", default-features = false }
+
+# Async runtime — transmutation is async-native (tokio).
+tokio        = { workspace = true }
+
+# Error handling
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+
+# Logging
+tracing      = { workspace = true }
+
+# Serialisation for the public Extraction type (for kb show / IPC)
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+[dev-dependencies]
+tempfile     = { workspace = true }
+tokio        = { workspace = true }

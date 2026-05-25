@@ -4,6 +4,7 @@ members = [
     "crates/kb-core",
     "crates/kb-watcher",
     "crates/kb-worker",
+    "crates/kb-extractor",
     "crates/kb-ops",
     "crates/kb-cli",
     "tests/integration",

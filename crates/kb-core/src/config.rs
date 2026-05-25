@@ -159,11 +159,16 @@ impl fmt::Display for ConfigErrors {
 /// Top-level configuration — maps 1-to-1 onto `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub paths:     PathsConfig,
-    pub watch:     WatchConfig,
-    pub worker:    WorkerConfig,
-    pub processor: ProcessorConfig,
-    pub ops:       OpsConfig,
+    pub paths:      PathsConfig,
+    pub watch:      WatchConfig,
+    pub worker:     WorkerConfig,
+    pub processor:  ProcessorConfig,
+    pub ops:        OpsConfig,
+    /// Per-source-folder precision rules for the extractor.  Optional in
+    /// `config.toml`; defaults to the fast (pure-Rust) extractor for every
+    /// path under `sources_dir`.
+    #[serde(default)]
+    pub extraction: ExtractionConfig,
 }
 
 /// Filesystem paths used by the daemon.
@@ -241,6 +246,116 @@ pub struct OpsConfig {
     pub log_format: String,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  Extraction (transmutation)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Precision tier the document extractor should use.
+///
+/// All three tiers run inside the kb binary — there is no Python and no
+/// separate process.  `Ffi` requires the binary to have been compiled with
+/// the `docling-ffi` cargo feature; the daemon refuses to start with a
+/// readable, friendly error if `Ffi` is requested at runtime but not
+/// compiled in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractionMode {
+    /// Default.  Pure Rust, ~80% similarity to ground truth, ~50 pages/sec
+    /// on a 2024 MacBook Pro.
+    Fast,
+    /// Pure Rust, ~95% similarity, similar throughput.
+    Precision,
+    /// docling-parse C++ via FFI (ONNX Runtime + libpdfium).  Highest
+    /// fidelity (~98%) at the cost of build size (+~60 MB) and a slower
+    /// first-run model load.  Requires `cargo build --features docling-ffi`.
+    Ffi,
+}
+
+impl Default for ExtractionMode {
+    fn default() -> Self { Self::Fast }
+}
+
+/// One per-folder rule.  When the candidate file's path is under
+/// `sources_dir/<path>` (recursively), the corresponding `mode` applies.
+///
+/// `path` is interpreted **relative to `sources_dir`** for ergonomics:
+/// users don't have to repeat their vault root in every rule.  Empty or
+/// `"."` matches every file under `sources_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractionRule {
+    /// Source-relative folder path; matches the folder and every descendant.
+    pub path: String,
+    pub mode: ExtractionMode,
+}
+
+/// Per-source-folder precision configuration.
+///
+/// ```toml
+/// [extraction]
+/// default_mode = "fast"   # fast | precision | ffi
+///
+/// # First-match-wins rules.  Path is relative to sources_dir.
+/// [[extraction.rules]]
+/// path = "ArchivePapers"
+/// mode = "precision"
+///
+/// [[extraction.rules]]
+/// path = "Legal"
+/// mode = "ffi"           # only valid if compiled with --features docling-ffi
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractionConfig {
+    #[serde(default)]
+    pub default_mode: ExtractionMode,
+    #[serde(default)]
+    pub rules: Vec<ExtractionRule>,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: ExtractionMode::Fast,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl ExtractionConfig {
+    /// Resolve the extraction mode for a candidate file.
+    ///
+    /// Both arguments must be absolute, canonical paths.  If `file` is not
+    /// inside `sources_dir`, returns the default mode (the caller is
+    /// expected to never invoke the extractor for an out-of-tree file, but
+    /// we don't panic on the edge).
+    ///
+    /// First-match-wins: rules are evaluated in declaration order.  An
+    /// empty `path` (or `"."`) matches every file.
+    pub fn mode_for(
+        &self,
+        file:        &std::path::Path,
+        sources_dir: &std::path::Path,
+    ) -> ExtractionMode {
+        let rel = match file.strip_prefix(sources_dir) {
+            Ok(r)  => r,
+            Err(_) => return self.default_mode,
+        };
+        for rule in &self.rules {
+            let pat = rule.path.trim();
+            // Empty / "." / "/" match the entire sources_dir.
+            if pat.is_empty() || pat == "." || pat == "/" {
+                return rule.mode;
+            }
+            let pat = pat.trim_start_matches('/').trim_end_matches('/');
+            let pat_path = std::path::Path::new(pat);
+            // ``rel`` starts with ``pat_path`` ⇒ rule applies.
+            if rel.starts_with(pat_path) {
+                return rule.mode;
+            }
+        }
+        self.default_mode
+    }
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 impl Default for Config {
@@ -289,6 +404,7 @@ impl Default for Config {
                 log_level:  "info".into(),
                 log_format: "json".into(),
             },
+            extraction: ExtractionConfig::default(),
         }
     }
 }
@@ -869,6 +985,7 @@ mod tests {
                 log_level:  "info".into(),
                 log_format: "json".into(),
             },
+            extraction: ExtractionConfig::default(),
         }
     }
 
@@ -1177,5 +1294,122 @@ mod tests {
         let display = ConfigErrors(errs).to_string();
         assert!(display.contains("[1]"), "missing item 1: {display}");
         assert!(display.contains("[2]"), "missing item 2: {display}");
+    }
+
+    // ── ExtractionConfig::mode_for ──────────────────────────────────────────
+
+    use std::path::PathBuf;
+
+    fn rule(path: &str, mode: ExtractionMode) -> ExtractionRule {
+        ExtractionRule { path: path.into(), mode }
+    }
+
+    #[test]
+    fn extraction_mode_default_when_no_rules() {
+        let cfg = ExtractionConfig {
+            default_mode: ExtractionMode::Fast,
+            rules: vec![],
+        };
+        let sources = PathBuf::from("/v/Sources");
+        let file    = sources.join("any/foo.pdf");
+        assert_eq!(cfg.mode_for(&file, &sources), ExtractionMode::Fast);
+    }
+
+    #[test]
+    fn extraction_mode_first_match_wins() {
+        let cfg = ExtractionConfig {
+            default_mode: ExtractionMode::Fast,
+            rules: vec![
+                rule("ArchivePapers", ExtractionMode::Precision),
+                rule("ArchivePapers/Old", ExtractionMode::Ffi), // unreachable; first wins
+            ],
+        };
+        let sources = PathBuf::from("/v/Sources");
+        let file    = sources.join("ArchivePapers/Old/2024.pdf");
+        assert_eq!(cfg.mode_for(&file, &sources), ExtractionMode::Precision);
+    }
+
+    #[test]
+    fn extraction_mode_recursive_match() {
+        let cfg = ExtractionConfig {
+            default_mode: ExtractionMode::Fast,
+            rules: vec![rule("Legal", ExtractionMode::Ffi)],
+        };
+        let sources = PathBuf::from("/v/Sources");
+        // Direct child.
+        assert_eq!(
+            cfg.mode_for(&sources.join("Legal/contract.pdf"), &sources),
+            ExtractionMode::Ffi,
+        );
+        // Deep descendant.
+        assert_eq!(
+            cfg.mode_for(&sources.join("Legal/2024/q4/x.pdf"), &sources),
+            ExtractionMode::Ffi,
+        );
+        // Sibling — falls through to default.
+        assert_eq!(
+            cfg.mode_for(&sources.join("Personal/diary.pdf"), &sources),
+            ExtractionMode::Fast,
+        );
+    }
+
+    #[test]
+    fn extraction_mode_empty_path_matches_root() {
+        for pat in ["", ".", "/"] {
+            let cfg = ExtractionConfig {
+                default_mode: ExtractionMode::Fast,
+                rules: vec![rule(pat, ExtractionMode::Precision)],
+            };
+            let sources = PathBuf::from("/v/Sources");
+            assert_eq!(
+                cfg.mode_for(&sources.join("foo.pdf"), &sources),
+                ExtractionMode::Precision,
+                "pattern {pat:?} should match root",
+            );
+        }
+    }
+
+    #[test]
+    fn extraction_mode_does_not_match_partial_segment() {
+        // "Archive" must NOT match "ArchivePapers" — segment-aware.
+        let cfg = ExtractionConfig {
+            default_mode: ExtractionMode::Fast,
+            rules: vec![rule("Archive", ExtractionMode::Precision)],
+        };
+        let sources = PathBuf::from("/v/Sources");
+        assert_eq!(
+            cfg.mode_for(&sources.join("ArchivePapers/x.pdf"), &sources),
+            ExtractionMode::Fast,
+            "prefix-only string match must not bleed across path segments",
+        );
+    }
+
+    #[test]
+    fn extraction_mode_file_outside_sources_returns_default() {
+        let cfg = ExtractionConfig {
+            default_mode: ExtractionMode::Precision,
+            rules: vec![rule("Anything", ExtractionMode::Fast)],
+        };
+        let sources = PathBuf::from("/v/Sources");
+        let outside = PathBuf::from("/elsewhere/file.pdf");
+        assert_eq!(cfg.mode_for(&outside, &sources), ExtractionMode::Precision);
+    }
+
+    #[test]
+    fn extraction_mode_serde_roundtrip() {
+        let toml_src = r#"
+            default_mode = "precision"
+            [[rules]]
+            path = "ArchivePapers"
+            mode = "precision"
+            [[rules]]
+            path = "Legal"
+            mode = "ffi"
+        "#;
+        let cfg: ExtractionConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.default_mode, ExtractionMode::Precision);
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[0].mode, ExtractionMode::Precision);
+        assert_eq!(cfg.rules[1].mode, ExtractionMode::Ffi);
     }
 }
