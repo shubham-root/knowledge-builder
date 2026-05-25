@@ -824,6 +824,10 @@ async def process(
         "link_sweep_examined": 0,
         "link_sweep_modified": 0,
         "link_sweep_replaced": 0,
+        "link_sweep_input":                0,
+        "link_sweep_skipped_outside_root": 0,
+        "link_sweep_skipped_not_a_file":   0,
+        "link_sweep_skipped_non_markdown": 0,
     }
     if agent_mode == "apply" and len(agent_result.plan) > 0:
         # Lazy import — keeps the cold-start cost off shadow-only paths.
@@ -835,6 +839,16 @@ async def process(
         touched = files_touched_by_plan(
             agent_result.plan.entries, vault_root,
         )
+        # Widen the input with files that newly appeared in the vault
+        # during the run.  This catches plan/disk drift — Obsidian's
+        # auto-disambiguation (`Foo.md` → `Foo 1.md` when `Foo.md`
+        # already exists) means the plan path may not exist on disk
+        # while a freshly-created note carrying unresolved wikilinks
+        # sits at a different path.  De-dup is handled inside
+        # ``sweep_files`` via its `seen` set.
+        created = list(getattr(agent_result, "created_during_run", []) or [])
+        if created:
+            touched = list(touched) + created
         if touched:
             try:
                 sweep_stats = sweep_files(
@@ -852,6 +866,22 @@ async def process(
                         sweep_stats.files_modified,
                         sweep_stats.examples[:5],
                     )
+                elif sweep_stats.files_examined == 0 and sweep_stats.files_input > 0:
+                    # The plan referenced files but none of them were
+                    # examined.  This is the symptom of plan/disk drift
+                    # (Obsidian auto-disambiguation, agent issued a
+                    # write to a non-create command not yet handled,
+                    # path-resolution mismatch).  Log loud enough to
+                    # diagnose without re-running the job.
+                    logger.warning(
+                        "link_sweep: skipped all %d plan path(s) without "
+                        "examining any (outside_root=%d, not_a_file=%d, "
+                        "non_markdown=%d) — plan/disk drift suspected",
+                        sweep_stats.files_input,
+                        sweep_stats.skipped_outside_root,
+                        sweep_stats.skipped_not_a_file,
+                        sweep_stats.skipped_non_markdown,
+                    )
                 else:
                     logger.info(
                         "link_sweep: clean (%d file(s) examined, no "
@@ -867,6 +897,10 @@ async def process(
                     "link_sweep_examined": 0,
                     "link_sweep_modified": 0,
                     "link_sweep_replaced": 0,
+                    "link_sweep_input":                0,
+                    "link_sweep_skipped_outside_root": 0,
+                    "link_sweep_skipped_not_a_file":   0,
+                    "link_sweep_skipped_non_markdown": 0,
                     "link_sweep_error":    f"{type(exc).__name__}: {exc}",
                 }
 

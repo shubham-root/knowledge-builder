@@ -341,7 +341,31 @@ class SweepFilesTests(unittest.TestCase):
             agent_root  = self.kb,
         )
         self.assertEqual(stats.files_examined, 0)
+        self.assertEqual(stats.skipped_non_markdown, 1)
         self.assertIn("[[Y]]", target.read_text(encoding="utf-8"))
+
+    def test_diagnostics_count_drift_to_nonexistent_path(self) -> None:
+        # Plan recorded a path that never made it to disk (e.g. Obsidian
+        # auto-disambiguated `Foo.md` -> `Foo 1.md`).  The sweeper must
+        # log a warning *and* report this in stats.skipped_not_a_file so
+        # the pipeline can surface plan/disk drift in the daemon log.
+        nonexistent = self.kb / "Renamed.md"
+        real        = self._write("KnowledgeBase/Real.md", "hi")
+        stats = sweep_files(
+            files       = [nonexistent, real],
+            vault_root  = self.vault,
+            sources_dir = self.sources,
+            agent_root  = self.kb,
+        )
+        self.assertEqual(stats.files_input,           2)
+        self.assertEqual(stats.files_examined,        1)  # only `real`
+        self.assertEqual(stats.skipped_not_a_file,    1)
+        self.assertEqual(stats.skipped_outside_root,  0)
+        # Metadata round-trip exposes the new keys.
+        meta = stats.as_metadata()
+        self.assertIn("link_sweep_input",                meta)
+        self.assertIn("link_sweep_skipped_not_a_file",   meta)
+        self.assertEqual(meta["link_sweep_skipped_not_a_file"], 1)
 
     def test_resolves_to_files_created_in_same_run(self) -> None:
         # The agent created BOTH `Main.md` and `Sub.md` in this run.

@@ -119,13 +119,25 @@ class SweepStats:
     files_modified:  int = 0
     links_replaced:  int = 0
     examples:        list[str] = field(default_factory=list)
+    #: Diagnostic counters for the case where the sweep walks the plan
+    #: but ends up examining zero files.  Useful for distinguishing
+    #: "plan was empty" from "plan/disk drift" (Obsidian's auto-
+    #: disambiguation, agent issued non-create writes, etc.).
+    files_input:     int = 0   # raw plan-derived paths handed to the sweep
+    skipped_outside_root: int = 0
+    skipped_not_a_file:   int = 0
+    skipped_non_markdown: int = 0
 
     def as_metadata(self) -> dict[str, object]:
         return {
-            "link_sweep_examined": self.files_examined,
-            "link_sweep_modified": self.files_modified,
-            "link_sweep_replaced": self.links_replaced,
-            "link_sweep_examples": self.examples[:20],
+            "link_sweep_examined":             self.files_examined,
+            "link_sweep_modified":             self.files_modified,
+            "link_sweep_replaced":             self.links_replaced,
+            "link_sweep_examples":             self.examples[:20],
+            "link_sweep_input":                self.files_input,
+            "link_sweep_skipped_outside_root": self.skipped_outside_root,
+            "link_sweep_skipped_not_a_file":   self.skipped_not_a_file,
+            "link_sweep_skipped_non_markdown": self.skipped_non_markdown,
         }
 
 
@@ -280,6 +292,7 @@ def sweep_files(
 
     seen: set[Path] = set()
     for raw in files:
+        stats.files_input += 1
         try:
             path = raw.resolve()
         except OSError:
@@ -296,12 +309,27 @@ def sweep_files(
                 "link_sweep: skipping %s (outside agent_root %s)",
                 path, agent_root_resolved,
             )
+            stats.skipped_outside_root += 1
             continue
 
         if not path.is_file():
+            # Plan path drifted from disk reality — e.g. Obsidian's
+            # auto-disambiguation rewrote `Foo.md` to `Foo 1.md` when
+            # `Foo.md` already existed, but the plan still records the
+            # requested path.  Surface this loudly because it means a
+            # newly-created note is sitting on disk under a different
+            # name and may be carrying unresolved wikilinks the sweep
+            # never gets to inspect.
+            logger.warning(
+                "link_sweep: plan path %s does not exist on disk "
+                "(plan/disk drift; possibly Obsidian auto-disambiguation)",
+                path,
+            )
+            stats.skipped_not_a_file += 1
             continue
         # Only markdown files have wikilinks worth sweeping.
         if path.suffix.lower() != ".md":
+            stats.skipped_non_markdown += 1
             continue
 
         try:

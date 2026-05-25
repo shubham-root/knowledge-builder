@@ -161,6 +161,13 @@ class AgentResult:
     #: model id, malformed skill, transient HTTP error).  Surfaced in
     #: failure metadata so operators can diagnose 0-turn deaths.
     pi_stderr:           str = ""
+    #: Vault paths (absolute) that exist *after* the agent run but did
+    #: not exist *before* it.  Computed from the same snapshot diff
+    #: that powers :func:`_audit_vault_diff`.  The link sweeper unions
+    #: this set with plan-derived paths so it catches files Obsidian
+    #: auto-disambiguated (e.g. ``Foo.md`` → ``Foo 1.md``) that the
+    #: plan still records under the original name.
+    created_during_run:  list[Path] = field(default_factory=list)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -832,6 +839,13 @@ def run_agent(inp: AgentInput) -> AgentResult:
     else:
         logger.info("vault audit: clean (no rogue writes)")
 
+    # Files that newly appeared during the run — used by the link
+    # sweeper as a robust complement to plan-derived paths (which can
+    # drift from disk reality when Obsidian auto-disambiguates a name).
+    created_during_run: list[Path] = [
+        Path(p) for p in (post_snapshot.keys() - pre_snapshot.keys())
+    ]
+
     elapsed = time.perf_counter() - started
     # Wait briefly for the stderr drainer to flush any tail bytes pi
     # emitted between its last stdout event and process exit.
@@ -865,6 +879,7 @@ def run_agent(inp: AgentInput) -> AgentResult:
         aborted              = aborted,
         rogue_writes         = rogue_writes,
         pi_stderr            = pi_stderr,
+        created_during_run   = created_during_run,
         metadata={
             "provider":     provider,
             "model":        model_id,
