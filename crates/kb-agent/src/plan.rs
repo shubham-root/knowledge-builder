@@ -350,6 +350,21 @@ fn value_type_name(v: &serde_json::Value) -> &'static str {
 /// flushed before this function returns so concurrent readers always
 /// see a complete record.
 ///
+/// **Concurrency safety.** The agent's `bash` tool can issue several
+/// `kb-obsidian` invocations in parallel within a single turn (and on
+/// Unix the underlying `obsidian` CLI may queue them).  Two writers
+/// landing in `append_entry` at the same time previously interleaved
+/// their `<json>` and `\n` syscalls, producing a corrupt JSONL file
+/// (`{...}{...}\n\n` instead of two well-formed lines).  We now:
+///
+/// 1. build the full `<json>\n` payload in memory before opening the
+///    file, so we issue exactly one `write_all`, and
+/// 2. take an exclusive advisory `flock(2)` on the file descriptor
+///    while writing.  POSIX guarantees a single `write(2)` to a file
+///    opened with `O_APPEND` is atomic relative to other appenders;
+///    the lock layered on top makes this hold even if `write_all`
+///    chunks the syscall.
+///
 /// Keys are sorted alphabetically (`applied`, `args`, `cmd`, …) so the
 /// wire format matches the Python wrapper's `json.dumps(..., sort_keys=True)`
 /// byte-for-byte.
@@ -373,13 +388,33 @@ pub fn append_entry(plan_file: &Path, entry: &PlanEntry) -> std::io::Result<()> 
     map.insert("ts",      serde_json::Value::Number(entry.ts.into()));
     let line = serde_json::to_string(&map)
         .expect("BTreeMap<&str, Value> always serialises");
+    // Build full payload (`<json>\n`) up front so a single write_all
+    // covers the record (1) regardless of buffer size.
+    let mut payload = Vec::with_capacity(line.len() + 1);
+    payload.extend_from_slice(line.as_bytes());
+    payload.push(b'\n');
+
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(plan_file)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
+
+    // Exclusive advisory lock; auto-released on `f`'s drop.
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = f.as_raw_fd();
+        // SAFETY: `fd` is valid for the lifetime of `f`; libc::flock is
+        // a thin syscall wrapper.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    f.write_all(&payload)?;
     f.flush()?;
+    // Lock released when `f` falls out of scope (close releases flock).
     Ok(())
 }
 
@@ -528,6 +563,67 @@ mod tests {
         append_entry(&p, &e2).unwrap();
         let plan = read_plan(&p).unwrap();
         assert_eq!(plan.entries, vec![e1, e2]);
+    }
+
+    /// Regression test: when several `kb-obsidian` invocations land in
+    /// `append_entry` concurrently (the agent's bash tool can issue
+    /// commands in parallel within a turn), the JSONL file used to end
+    /// up with two records concatenated on the same line, e.g.
+    /// `{...}{...}\n` instead of `{...}\n{...}\n`.  We now combine the
+    /// payload + `\n` into a single `write_all` and take an `flock` on
+    /// the file descriptor; this test fires N threads that each append
+    /// a sizeable record (8 KiB content field) and asserts every line
+    /// of the resulting JSONL parses cleanly.
+    #[test]
+    fn concurrent_appends_produce_well_formed_jsonl() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let p = Arc::new(tmp.path().join("concurrent.jsonl"));
+
+        // Each writer hammers append_entry 50 times — with 8 threads
+        // that's 400 records, plenty to surface interleaving.
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+        let mut handles = Vec::new();
+        for tid in 0..THREADS {
+            let path = Arc::clone(&p);
+            handles.push(thread::spawn(move || {
+                // Big content payload makes a torn write more likely.
+                let big = "x".repeat(8 * 1024);
+                for i in 0..PER_THREAD {
+                    let e = PlanEntry {
+                        ts: (tid * PER_THREAD + i) as i64,
+                        mode: "apply".into(),
+                        cmd:  "create".into(),
+                        args: vec![
+                            format!("path=KnowledgeBase/T{tid}-{i}.md"),
+                            format!("content={big}"),
+                        ],
+                        applied: true,
+                        exit_code: Some(0),
+                    };
+                    append_entry(&path, &e).unwrap();
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+
+        // Every line must parse.  Total count must equal threads * per_thread.
+        let plan = read_plan(&p).expect("plan must parse cleanly after concurrent writes");
+        assert_eq!(plan.entries.len(), THREADS * PER_THREAD,
+            "expected {} entries, got {}",
+            THREADS * PER_THREAD, plan.entries.len(),
+        );
+        // Sanity: no record was truncated mid-content.
+        for entry in &plan.entries {
+            let content = entry.args.iter()
+                .find(|a| a.starts_with("content="))
+                .expect("every entry has a content arg");
+            let body = &content["content=".len()..];
+            assert_eq!(body.len(), 8 * 1024, "truncated content: {} bytes", body.len());
+        }
     }
 
     #[test]
