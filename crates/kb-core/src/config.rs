@@ -8,6 +8,12 @@
 //! 2. `~/.config/knowledge-builder/config.toml`
 //! 3. Built-in defaults
 //!
+//! ## Config file location
+//! The path is `~/.config/knowledge-builder/config.toml` on **all** platforms
+//! (deliberately not `dirs::config_dir()`, which on macOS resolves to
+//! `~/Library/Application Support` and would diverge from the documented and
+//! user-expected XDG-style location).  Use [`config_file_path`] to obtain it.
+//!
 //! ## Path expansion
 //! All path-valued fields (`vault_root`, `sources_dir`, `db_path`, `log_dir`,
 //! `processor.command`, `processor.work_dir_root`) undergo `~` expansion
@@ -67,6 +73,31 @@ pub enum ConfigError {
          Action: set sources_dir to a strict subdirectory of vault_root (e.g. vault_root/Sources)."
     )]
     SourcesSameAsVault { sources_dir: String, vault_root: String },
+
+    /// agent_root does not exist or cannot be created, is not a directory,
+    /// or is not readable+writable.
+    #[error(
+        "agent_root '{path}': {detail}\n\
+         Action: ensure the directory exists or can be created and that the current user has read+write access."
+    )]
+    AgentRoot { path: String, detail: String },
+
+    /// agent_root is not a strict subdirectory of vault_root.
+    #[error(
+        "agent_root '{agent_root}' is not strictly inside vault_root '{vault_root}'.\n\
+         Action: set agent_root to a path nested inside (and not equal to) vault_root.  \
+         Default: <vault_root>/KnowledgeBase."
+    )]
+    AgentRootNotInsideVault { agent_root: String, vault_root: String },
+
+    /// agent_root and sources_dir overlap (one is inside the other, or they
+    /// are the same).  These two MUST be disjoint subtrees.
+    #[error(
+        "agent_root '{agent_root}' overlaps sources_dir '{sources_dir}'.\n\
+         Action: agent_root and sources_dir must be disjoint directories \
+         (neither one inside the other)."
+    )]
+    AgentRootOverlapsSources { agent_root: String, sources_dir: String },
 
     /// processor.command could not be found or is not executable.
     #[error(
@@ -142,10 +173,24 @@ pub struct PathsConfig {
     pub vault_root: String,
     /// Subdirectory of `vault_root` where source files are dropped.
     pub sources_dir: String,
+    /// Subdirectory of `vault_root` reserved exclusively for content the
+    /// agent may create, modify, or delete.  Reads are unrestricted; writes
+    /// outside this directory are rejected by the kb-obsidian wrapper.
+    /// Defaults to `vault_root/KnowledgeBase`.
+    #[serde(default = "default_agent_root")]
+    pub agent_root: String,
     /// SQLite database file path.
     pub db_path: String,
     /// Directory for rotating log files.
     pub log_dir: String,
+}
+
+/// Default value for [`PathsConfig::agent_root`].  Used when the field is
+/// absent from `config.toml`.  We can't reference `vault_root` here (no
+/// access to other fields), so we emit a sentinel that
+/// [`expand_all_paths`] resolves into `<vault_root>/KnowledgeBase`.
+fn default_agent_root() -> String {
+    "<vault_root>/KnowledgeBase".to_string()
 }
 
 /// File-watching parameters.
@@ -204,6 +249,7 @@ impl Default for Config {
             paths: PathsConfig {
                 vault_root:  "~/Vault".into(),
                 sources_dir: "~/Vault/Sources".into(),
+                agent_root:  "~/Vault/KnowledgeBase".into(),
                 db_path:     "~/Library/Application Support/knowledge-builder/state.db".into(),
                 log_dir:     "~/Library/Logs/knowledge-builder".into(),
             },
@@ -234,8 +280,8 @@ impl Default for Config {
                 backoff_secs: vec![30, 300, 1_800],
             },
             processor: ProcessorConfig {
-                command:       "processors/default/run.sh".into(),
-                timeout_secs:  1_800,
+                command:       "~/.local/share/kb/venv/bin/kb-processor".into(),
+                timeout_secs:  3_600,
                 work_dir_root: "~/Library/Caches/knowledge-builder/jobs".into(),
             },
             ops: OpsConfig {
@@ -267,7 +313,9 @@ fn expand_tilde(path: &str) -> String {
     path.to_owned()
 }
 
-/// Apply `expand_tilde` to every path-valued field in the config.
+/// Apply `expand_tilde` to every path-valued field in the config.  Also
+/// resolves the `<vault_root>` sentinel inside `agent_root` (left there by
+/// the default value when no override is provided in `config.toml`).
 fn expand_all_paths(mut cfg: Config) -> Config {
     cfg.paths.vault_root        = expand_tilde(&cfg.paths.vault_root);
     cfg.paths.sources_dir       = expand_tilde(&cfg.paths.sources_dir);
@@ -275,6 +323,18 @@ fn expand_all_paths(mut cfg: Config) -> Config {
     cfg.paths.log_dir           = expand_tilde(&cfg.paths.log_dir);
     cfg.processor.command       = expand_tilde(&cfg.processor.command);
     cfg.processor.work_dir_root = expand_tilde(&cfg.processor.work_dir_root);
+
+    // Resolve the `<vault_root>` sentinel BEFORE tilde expansion in case
+    // the user explicitly wrote `<vault_root>/Foo` in their config (we
+    // honour that the same way the default value is handled).
+    if cfg.paths.agent_root.contains("<vault_root>") {
+        cfg.paths.agent_root = cfg
+            .paths
+            .agent_root
+            .replace("<vault_root>", &cfg.paths.vault_root);
+    }
+    cfg.paths.agent_root = expand_tilde(&cfg.paths.agent_root);
+
     cfg
 }
 
@@ -313,7 +373,7 @@ impl Config {
         let sources_canon = check_sources_dir(&self.paths.sources_dir, &mut errors);
 
         // ── 3 & 4. Containment checks (require both canonicalized paths) ─────
-        if let (Some(ref vc), Some(ref sc)) = (vault_canon, sources_canon) {
+        if let (Some(vc), Some(sc)) = (vault_canon.as_ref(), sources_canon.as_ref()) {
             // 3. sources_dir must be inside vault_root
             if !sc.starts_with(vc) {
                 errors.push(ConfigError::SourcesNotInsideVault {
@@ -326,6 +386,32 @@ impl Config {
                 errors.push(ConfigError::SourcesSameAsVault {
                     sources_dir: sc.display().to_string(),
                     vault_root:  vc.display().to_string(),
+                });
+            }
+        }
+
+        // ── 4b. agent_root: creatable, inside vault_root, disjoint from
+        //          sources_dir.  This is the policy boundary that confines
+        //          all agent mutations to a dedicated subtree.
+        let agent_canon = check_agent_root(&self.paths.agent_root, &mut errors);
+        if let (Some(vc), Some(ac)) = (vault_canon.as_ref(), agent_canon.as_ref()) {
+            // Must be strictly inside vault_root.
+            if !ac.starts_with(vc) || ac == vc {
+                errors.push(ConfigError::AgentRootNotInsideVault {
+                    agent_root: ac.display().to_string(),
+                    vault_root: vc.display().to_string(),
+                });
+            }
+        }
+        if let (Some(sc), Some(ac)) = (sources_canon.as_ref(), agent_canon.as_ref()) {
+            // agent_root and sources_dir must be disjoint trees.
+            if sc == ac
+                || ac.starts_with(sc)
+                || sc.starts_with(ac)
+            {
+                errors.push(ConfigError::AgentRootOverlapsSources {
+                    agent_root:  ac.display().to_string(),
+                    sources_dir: sc.display().to_string(),
                 });
             }
         }
@@ -348,6 +434,22 @@ impl Config {
 
 // ── Free-standing helpers (public for `kb config show` / tests) ───────────────
 
+/// Resolved path to the TOML config file: `~/.config/knowledge-builder/config.toml`.
+///
+/// This is the single source of truth used by `load_raw`, `kb config path`,
+/// and `kb doctor`.  See the module-level docs for why we do *not* use
+/// `dirs::config_dir()` here.
+///
+/// Falls back to a literal `.config/...` relative path only if `dirs::home_dir()`
+/// returns `None` (effectively never on macOS/Linux for a logged-in user).
+pub fn config_file_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("knowledge-builder")
+        .join("config.toml")
+}
+
 /// Load configuration from disk + environment **without** running validation.
 ///
 /// Suitable for `kb config show`, `kb config path`, and any context where the
@@ -358,10 +460,7 @@ pub fn load_raw() -> crate::Result<Config> {
         Figment,
     };
 
-    let config_path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("knowledge-builder")
-        .join("config.toml");
+    let config_path = config_file_path();
 
     let cfg: Config = Figment::new()
         .merge(Serialized::defaults(Config::default()))
@@ -480,6 +579,81 @@ fn check_sources_dir(path: &str, errors: &mut Vec<ConfigError>) -> Option<PathBu
         Ok(c)  => Some(c),
         Err(e) => {
             errors.push(ConfigError::SourcesDir {
+                path:   path.to_owned(),
+                detail: format!("cannot canonicalize path: {e}"),
+            });
+            None
+        }
+    }
+}
+
+/// Check 4b: agent_root exists (or can be created), is a directory, is
+/// readable + writable.  Auto-creates the directory when missing so a
+/// fresh install can reach a green ``kb doctor`` without manual mkdir.
+/// Returns ``Some(canonical_path)`` on success, ``None`` on any failure.
+fn check_agent_root(path: &str, errors: &mut Vec<ConfigError>) -> Option<PathBuf> {
+    let p = Path::new(path);
+
+    // Auto-create the directory if absent.  We do this for agent_root
+    // (but not for vault_root or sources_dir) because those two represent
+    // user-owned content that should already exist; agent_root is a
+    // policy artefact owned entirely by Knowledge Builder.
+    if !p.exists() {
+        if let Err(e) = fs::create_dir_all(p) {
+            errors.push(ConfigError::AgentRoot {
+                path:   path.to_owned(),
+                detail: format!("directory does not exist and could not be created: {e}"),
+            });
+            return None;
+        }
+    }
+
+    // Existence + is-directory.
+    match fs::metadata(p) {
+        Err(e) => {
+            errors.push(ConfigError::AgentRoot {
+                path:   path.to_owned(),
+                detail: format!("cannot access: {e}"),
+            });
+            return None;
+        }
+        Ok(m) if !m.is_dir() => {
+            errors.push(ConfigError::AgentRoot {
+                path:   path.to_owned(),
+                detail: "path exists but is not a directory".to_owned(),
+            });
+            return None;
+        }
+        Ok(_) => {}
+    }
+
+    // Readability + writability: probe with a temp file.
+    if let Err(e) = fs::read_dir(p) {
+        errors.push(ConfigError::AgentRoot {
+            path:   path.to_owned(),
+            detail: format!("directory is not readable: {e}"),
+        });
+        return None;
+    }
+    let probe = p.join(".kb-agent-write-probe");
+    match fs::write(&probe, b"") {
+        Err(e) => {
+            errors.push(ConfigError::AgentRoot {
+                path:   path.to_owned(),
+                detail: format!("directory is not writable: {e}"),
+            });
+            return None;
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);     // best-effort cleanup
+        }
+    }
+
+    // Canonicalize.
+    match fs::canonicalize(p) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            errors.push(ConfigError::AgentRoot {
                 path:   path.to_owned(),
                 detail: format!("cannot canonicalize path: {e}"),
             });
@@ -669,6 +843,7 @@ mod tests {
             paths: PathsConfig {
                 vault_root:  vault.to_str().unwrap().to_owned(),
                 sources_dir: sources.to_str().unwrap().to_owned(),
+                agent_root:  vault.join("KnowledgeBase").to_str().unwrap().to_owned(),
                 db_path:     db.to_str().unwrap().to_owned(),
                 log_dir:     logs.to_str().unwrap().to_owned(),
             },
@@ -808,6 +983,89 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(e, ConfigError::ProcessorCommand { .. })),
             "expected ProcessorCommand error, got: {errs:?}"
+        );
+    }
+
+    // ── agent_root checks (4b) ─────────────────────────────────────────────────
+
+    #[test]
+    fn check4b_agent_root_auto_created() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        let new_agent = tmp.path().join("vault").join("FreshKnowledgeBase");
+        assert!(!new_agent.exists());
+        cfg.paths.agent_root = new_agent.to_str().unwrap().to_owned();
+        cfg.validate().expect("agent_root should auto-create");
+        assert!(new_agent.is_dir(), "agent_root should have been created");
+    }
+
+    #[test]
+    fn check4b_agent_root_outside_vault_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        let outside = tmp.path().join("outside-vault");
+        fs::create_dir_all(&outside).unwrap();
+        cfg.paths.agent_root = outside.to_str().unwrap().to_owned();
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, ConfigError::AgentRootNotInsideVault { .. })),
+            "expected AgentRootNotInsideVault error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn check4b_agent_root_overlaps_sources_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        cfg.paths.agent_root = cfg.paths.sources_dir.clone();
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, ConfigError::AgentRootOverlapsSources { .. })),
+            "expected AgentRootOverlapsSources error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn check4b_agent_root_inside_sources_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        let nested = std::path::PathBuf::from(&cfg.paths.sources_dir).join("nested-kb");
+        fs::create_dir_all(&nested).unwrap();
+        cfg.paths.agent_root = nested.to_str().unwrap().to_owned();
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, ConfigError::AgentRootOverlapsSources { .. })),
+            "expected AgentRootOverlapsSources error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn check4b_agent_root_equals_vault_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        cfg.paths.agent_root = cfg.paths.vault_root.clone();
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, ConfigError::AgentRootNotInsideVault { .. })),
+            "expected AgentRootNotInsideVault when agent_root == vault_root, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn vault_root_sentinel_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = valid_config(&tmp);
+        cfg.paths.agent_root = "<vault_root>/AutoKB".into();
+        let cfg = expand_all_paths(cfg);
+        assert!(
+            cfg.paths.agent_root.ends_with("/AutoKB"),
+            "sentinel not resolved: {}",
+            cfg.paths.agent_root,
+        );
+        assert!(
+            !cfg.paths.agent_root.contains("<vault_root>"),
+            "sentinel literal still present: {}",
+            cfg.paths.agent_root,
         );
     }
 

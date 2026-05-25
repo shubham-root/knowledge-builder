@@ -264,6 +264,13 @@ pub struct ProcessorInput {
     /// of `vault_root`).
     pub sources_dir: PathBuf,
 
+    /// Canonical absolute path to the agent's mutation sandbox (strict
+    /// sub-directory of `vault_root`, disjoint from `sources_dir`).  All
+    /// agent-driven writes are confined to this tree by the kb-obsidian
+    /// wrapper.
+    #[serde(default)]
+    pub agent_root: PathBuf,
+
     /// Per-job working directory under `processor.work_dir_root`.
     /// The processor should write all transient artifacts here.
     pub work_dir: PathBuf,

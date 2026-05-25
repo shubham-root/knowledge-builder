@@ -7,6 +7,7 @@ node_modules/
 dist/
 build/
 out/
+target/
 .next/
 .nuxt/
 .vuepress/dist
@@ -15,6 +16,34 @@ out/
 .env
 .env.local
 .env.*.local
+
+# Knowledge Builder—specific
+# Secrets file: never commit; loaded by the daemon at runtime from
+# ~/.config/knowledge-builder/ (which is outside this repo).
+secrets.env
+*.secrets.env
+# In-tree dev journals
+task_update.md
+# Personal sample inputs
+sample-vaults/
+sample-sources/
+
+# Python bytecode caches (should never be committed)
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+
+# Python virtualenvs
+venv/
+.venv/
+env/
+
+# Pytest / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .idea/

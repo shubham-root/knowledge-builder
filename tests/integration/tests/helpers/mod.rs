@@ -245,6 +245,7 @@ impl TestVault {
             paths: PathsConfig {
                 vault_root:  self.vault_root.to_string_lossy().to_string(),
                 sources_dir: self.sources_dir.to_string_lossy().to_string(),
+                agent_root:  self.vault_root.join("KnowledgeBase").to_string_lossy().to_string(),
                 db_path:     self.db_path.to_string_lossy().to_string(),
                 log_dir:     self.work_dir_root.to_string_lossy().to_string(),
             },
@@ -325,9 +326,11 @@ impl TestVault {
             config.worker.concurrency,
             self.store.clone(),
             config.processor.clone(),
+            std::collections::BTreeMap::new(),
             shutdown,
             PathBuf::from(&config.paths.vault_root),
             PathBuf::from(&config.paths.sources_dir),
+            PathBuf::from(&config.paths.agent_root),
         );
         pool.run()
     }

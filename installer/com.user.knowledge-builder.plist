@@ -40,8 +40,18 @@
     <key>StandardErrorPath</key>
     <string>{{LOG_DIR}}/stderr.log</string>
 
-    <!-- Runtime environment: ensure common binary locations are on PATH for
-         subprocesses (Python processor, system tools) on both Intel and Apple Silicon -->
+    <!-- Runtime environment.
+
+         PATH is required so subprocesses (the Python processor, system tools)
+         can find their executables on both Intel and Apple Silicon.
+
+         **Secrets and LLM configuration belong in
+         `~/.config/knowledge-builder/secrets.env` (mode 600), NOT here.**
+         The daemon loads that file at startup and forwards every key into
+         each processor subprocess via `Command::envs()`.  This keeps the
+         plist (which is plaintext, mode 644) free of credentials, and gives
+         identical behaviour whether the daemon is run by launchd or by
+         `kb daemon --foreground`. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

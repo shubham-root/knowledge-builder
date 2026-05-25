@@ -74,20 +74,31 @@ impl ValidationError {
 
 /// Validate every output path returned by a processor invocation.
 ///
-/// Iterates `outputs` in order.  For each entry:
+/// Iterates `outputs` in order.  For each entry, calls
+/// [`kb_core::paths::validate_output`] which canonicalizes the path and
+/// checks both invariants.
 ///
-/// 1. Calls [`kb_core::paths::validate_output`] which canonicalizes the path
-///    and checks both invariants.
-/// 2. On success, appends the canonical `PathBuf` to the result vector.
-/// 3. On **first** failure, logs a [`tracing::error!`] and returns immediately
-///    (**fail-fast** — subsequent paths are not checked).
+/// Errors are partitioned into two categories:
+///
+/// * **Fatal** — [`ValidationError::OutputOutsideVault`] and
+///   [`ValidationError::OutputInsideSources`].  These indicate the
+///   processor wrote (or claimed to write) somewhere it must not.  The
+///   first such error aborts validation and is returned as `Err`.
+///
+/// * **Non-fatal** — [`ValidationError::CanonicalizeFailed`] and
+///   [`ValidationError::OutputNotFile`].  These mean a claimed output
+///   does not exist on disk (e.g. the agent typo'd a `file=` wikilink
+///   that obsidian then resolved to nothing) or refers to a directory.
+///   These are logged at WARN and the offending entry is *dropped*
+///   from the returned vector — the rest are still recorded.  Missing-
+///   file is a QA issue, not a security boundary; failing the entire
+///   batch on it would lose the 9 valid outputs that did materialise.
 ///
 /// # Errors
-/// Returns the first [`ValidationError`] encountered.
+/// Returns the first fatal [`ValidationError`].
 ///
 /// # Logging
-/// Every violation is logged at `ERROR` level with the offending path and the
-/// relevant boundary path (`vault_root` or `sources_dir`).
+/// Fatal violations log at `ERROR`; non-fatal ones log at `WARN`.
 pub fn validate_processor_outputs(
     outputs: &[ProcessOutput],
     vault_root: &Path,
@@ -104,14 +115,36 @@ pub fn validate_processor_outputs(
             }
             Err(e) => {
                 let validation_err = map_output_error(e, path, vault_root, sources_dir);
-                tracing::error!(
-                    path          = %path.display(),
-                    vault_root    = %vault_root.display(),
-                    sources_dir   = %sources_dir.display(),
-                    error         = %validation_err,
-                    "processor output failed invariant check — non-retryable"
-                );
-                return Err(validation_err);
+                match validation_err {
+                    // Policy violations — always fatal.
+                    ValidationError::OutputOutsideVault { .. }
+                    | ValidationError::OutputInsideSources { .. } => {
+                        tracing::error!(
+                            path        = %path.display(),
+                            vault_root  = %vault_root.display(),
+                            sources_dir = %sources_dir.display(),
+                            error       = %validation_err,
+                            "processor output failed path invariant — marking failed (non-retryable)",
+                        );
+                        return Err(validation_err);
+                    }
+                    // Existence / regular-file issues — log warning and skip.
+                    // Most common cause: the agent typo'd a `file=` wikilink in
+                    // a property:set, the wrapper recorded `applied=true` based
+                    // on obsidian's exit code, but no file actually exists at
+                    // that path.  Dropping it is the right call — the other
+                    // outputs in the batch are real and worth recording.
+                    ValidationError::CanonicalizeFailed { .. }
+                    | ValidationError::OutputNotFile { .. } => {
+                        tracing::warn!(
+                            path  = %path.display(),
+                            error = %validation_err,
+                            "claimed output not present on disk — dropping from outputs list, \
+                             continuing with the remaining outputs in this batch",
+                        );
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -228,39 +261,29 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn fails_on_first_bad_output_and_stops() {
+    fn fails_on_first_policy_violation_and_stops() {
+        // Policy violations (OutsideVault / InsideSources) remain fatal
+        // and abort the batch; only existence/file-type errors are
+        // soft-dropped.
         let vault = make_vault();
         let sources = mk_dir(vault.path(), "sources");
         let notes = mk_dir(vault.path(), "notes");
 
-        // good, bad, good — should fail on the bad one, never touch the third
         let good = mk(&notes, "good.md");
-        let outside = {
-            let tmp = tempfile::tempdir().unwrap();
-            let p = tmp.path().join("outside.md");
-            fs::write(&p, b"x").unwrap();
-            // We need to keep tmp alive so the file exists for canonicalize
-            // but the path is outside the vault — it won't reach the IS-file check
-            // because OutsideVault fires first.
-            // Use a path that definitely doesn't exist inside vault:
-            p.to_path_buf()
-            // tmp drops here and removes the dir — that's fine; we want to test
-            // the case where the path is simply outside vault_root, which is
-            // caught before the file-exists check.
-        };
+        let in_sources = mk(&sources, "forbidden.md");
         let good2 = mk(&notes, "good2.md");
 
         let outputs = vec![
             process_output(good),
-            process_output(outside),
+            process_output(in_sources),
             process_output(good2),
         ];
 
-        // The second entry (outside vault) should cause an error.
-        // Because tmp was dropped the file no longer exists → CanonicalizeFailed.
-        // Either way it must be an Err.
         let result = validate_processor_outputs(&outputs, vault.path(), &sources);
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(ValidationError::OutputInsideSources { .. }),
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -299,32 +322,52 @@ mod tests {
     }
 
     #[test]
-    fn not_a_file_maps_correctly() {
+    fn not_a_file_dropped_from_outputs() {
+        // Directories and other non-file targets are now WARN-and-skip,
+        // not fatal.  The result is a (smaller) Ok vec.
         let vault = make_vault();
         let sources = mk_dir(vault.path(), "sources");
-        // A directory inside the vault (not a regular file)
         let subdir = mk_dir(vault.path(), "subdir");
 
         let outputs = vec![process_output(subdir)];
-        let err =
-            validate_processor_outputs(&outputs, vault.path(), &sources).unwrap_err();
-
-        assert!(matches!(err, ValidationError::OutputNotFile { .. }));
-        assert!(!err.is_validation_retryable());
+        let result = validate_processor_outputs(&outputs, vault.path(), &sources).unwrap();
+        assert!(result.is_empty(), "non-file outputs should be dropped, not included");
     }
 
     #[test]
-    fn nonexistent_path_maps_to_canonicalize_failed() {
+    fn nonexistent_path_dropped_from_outputs() {
+        // The agent occasionally typos a wikilink in `property:set file=...`;
+        // obsidian returns 0 (no-op) so the wrapper marks `applied=true` but
+        // no file materialises at that path.  Drop it from outputs, keep
+        // the rest.
         let vault = make_vault();
         let sources = mk_dir(vault.path(), "sources");
         let ghost = vault.path().join("does_not_exist.md");
 
         let outputs = vec![process_output(ghost)];
-        let err =
-            validate_processor_outputs(&outputs, vault.path(), &sources).unwrap_err();
+        let result = validate_processor_outputs(&outputs, vault.path(), &sources).unwrap();
+        assert!(result.is_empty(), "non-existent paths should be dropped, not fatal");
+    }
 
-        assert!(matches!(err, ValidationError::CanonicalizeFailed { .. }));
-        assert!(!err.is_validation_retryable());
+    #[test]
+    fn good_outputs_kept_when_one_is_missing() {
+        // The critical regression test: nine real outputs + one typo'd
+        // wikilink should produce nine recorded outputs, not zero.
+        let vault = make_vault();
+        let sources = mk_dir(vault.path(), "sources");
+        let notes = mk_dir(vault.path(), "notes");
+        let real1 = mk(&notes, "real1.md");
+        let real2 = mk(&notes, "real2.md");
+        let ghost = vault.path().join("does_not_exist.md");
+
+        let outputs = vec![
+            process_output(real1),
+            process_output(ghost),
+            process_output(real2),
+        ];
+        let result =
+            validate_processor_outputs(&outputs, vault.path(), &sources).unwrap();
+        assert_eq!(result.len(), 2, "expected the two real outputs to survive");
     }
 
     // ------------------------------------------------------------------

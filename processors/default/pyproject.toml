@@ -18,6 +18,23 @@ dependencies = [
     "Pillow>=10.0.0",
     # Pydantic v2 for the processor I/O contract models (models.py).
     "pydantic>=2.0.0",
+    # ------------------------------------------------------------------ #
+    # MPS × transformers regression pin                                  #
+    # ------------------------------------------------------------------ #
+    # transformers 5.9.0 hard-codes ``torch.arange(..., dtype=torch.float64,
+    # device=device)`` inside ``rt_detr_v2.modeling_rt_detr_v2.
+    # build_2d_sinusoidal_position_embedding``.  Apple's MPS backend does
+    # not support ``float64`` and crashes every page of every PDF with
+    #   TypeError: Cannot convert a MPS Tensor to float64 dtype
+    # Setting ``DOCLING_DEVICE=cpu`` does NOT work around it (the layout
+    # model still ends up on MPS via docling internals).
+    #
+    # transformers 5.8.x runs fine on MPS at full GPU speed.  Pin until
+    # docling PR #2721 (proper float16 MPS support) ships and we have a
+    # docling release built against a fixed transformers.
+    #
+    # Tracking: https://github.com/docling-project/docling/issues/3483
+    "transformers>=5.8.1,<5.9.0",
 ]
 
 [project.optional-dependencies]

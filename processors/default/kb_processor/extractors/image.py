@@ -108,7 +108,7 @@ def _docling_ocr(path: Path) -> str:
         ``False`` for content-level failures.
     """
     try:
-        from docling.document_converter import DocumentConverter  # type: ignore[import]
+        from ._docling_accel import make_accelerated_converter  # noqa: PLC0415
     except ImportError as exc:
         raise ExtractionError(
             f"docling is not installed — cannot extract image {path}: {exc}",
@@ -116,7 +116,7 @@ def _docling_ocr(path: Path) -> str:
         ) from exc
 
     try:
-        converter = DocumentConverter()
+        converter = make_accelerated_converter()
         result = converter.convert(str(path))
         return result.document.export_to_markdown()
     except OSError as exc:

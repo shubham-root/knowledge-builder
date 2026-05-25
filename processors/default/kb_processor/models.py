@@ -59,6 +59,15 @@ class ProcessorInput(BaseModel):
     sources_dir: Path = Field(
         description="Absolute path to the sources sub-directory inside the vault."
     )
+    agent_root: Path | None = Field(
+        default=None,
+        description=(
+            "Absolute path to the agent's mutation sandbox (a strict "
+            "sub-directory of vault_root, disjoint from sources_dir).  "
+            "All agent-driven writes are confined to this tree.  When "
+            "absent, defaults to vault_root/KnowledgeBase."
+        ),
+    )
     work_dir: Path = Field(
         description=(
             "Absolute path to the per-job working directory.  "

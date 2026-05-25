@@ -29,13 +29,17 @@
 //!
 //! a. Log "Shutting down..."
 //! b. Record `daemon_stopping` audit event.
-//! c. Cancel the [`CancellationToken`] (propagates to pipeline, scanner, pool).
-//! d. Wait up to 30 s for the worker-pool claim loop to exit, then poll the
-//!    DB until all in-flight processor jobs complete (or the 30 s budget runs
-//!    out).
-//! e. If the budget runs out, log a warning — recovery (step g) handles stale
-//!    rows.  The platform-level SIGTERM/SIGKILL of subprocesses is handled by
-//!    each job's own `invoke_processor` timeout logic.
+//! c. Cancel the [`CancellationToken`] (propagates to pipeline, scanner, pool,
+//!    **and every in-flight processor subprocess**).  Each running
+//!    `invoke_processor` reacts by sending `SIGTERM` to its child's process
+//!    group, waiting 5 s, then `SIGKILL` — guaranteeing no Python
+//!    subprocesses survive as orphans (PPID=1) after the daemon exits.
+//! d. Wait up to 5 s for the worker-pool claim loop to exit, then poll the
+//!    DB until all in-flight processor jobs complete (or the 30 s budget
+//!    runs out).  Cancelled jobs leave their row in `processing` (no
+//!    `attempts` increment) so step g resets them to `queued` for retry.
+//! e. If the budget runs out, log a warning — recovery (step g) handles
+//!    stale rows.
 //! f. Wait up to 5 s for the detection pipeline and scanner tasks to exit.
 //! g. Call `recover_in_flight_with_config` to reset any remaining
 //!    `processing` rows to `queued` so the next daemon start retries them.
@@ -195,6 +199,44 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
 
     let scanner_handle = scanner.run(shutdown.clone());
 
+    // ── 8b. Load processor secrets (single source of truth) ──────────────────
+    //
+    // `~/.config/knowledge-builder/secrets.env` holds the env vars that the
+    // processor subprocess needs (e.g. `KB_LLM_MODEL`, `OPENROUTER_API_KEY`).
+    // Loading them here — inside the daemon — means foreground execution and
+    // launchd-managed execution behave identically, and the LaunchAgent
+    // plist no longer needs to carry secrets in plaintext.
+    //
+    // Missing file → silent success (empty map).  Permissive perms (group/
+    // world readable) trigger a warning but do not block startup.
+    let secrets = match kb_core::load_secrets() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to load secrets file (continuing without it)");
+            kb_core::SecretsLoad::default()
+        }
+    };
+    if secrets.loaded {
+        if secrets.insecure_perms {
+            warn!(
+                path = %secrets.path.display(),
+                mode = format!("{:o}", secrets.mode.unwrap_or(0)),
+                "secrets file is group/world-accessible — run: chmod 600 <path>",
+            );
+        }
+        info!(
+            path = %secrets.path.display(),
+            keys = ?secrets.keys(),
+            "loaded {} key(s) from secrets file",
+            secrets.entries.len(),
+        );
+    } else {
+        info!(
+            path = %secrets.path.display(),
+            "no secrets file found (processor will use only inherited env)",
+        );
+    }
+
     // ── 9. Start the worker pool ──────────────────────────────────────────────
     //
     // Workers atomically claim `queued` rows and process them via the
@@ -204,9 +246,11 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
         config.worker.concurrency,
         state.clone(),
         config.processor.clone(),
+        secrets.entries,
         shutdown.clone(),
         PathBuf::from(&config.paths.vault_root),
         PathBuf::from(&config.paths.sources_dir),
+        PathBuf::from(&config.paths.agent_root),
     );
 
     let pool_handle = pool.run();
@@ -277,11 +321,12 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     // Now wait up to 30 s for any in-flight jobs to drain.
     wait_for_jobs_to_drain(&state, Duration::from_secs(30)).await;
 
-    // e. The PLAN §12 note about sending SIGTERM/SIGKILL to processor
-    //    subprocesses is handled at the individual-job level: each invocation
-    //    of `invoke_processor` already enforces `timeout_secs` with a
-    //    SIGTERM → grace → SIGKILL sequence.  After the 30 s drain window, any
-    //    remaining rows are reset by recovery (step g).
+    // e. Each in-flight processor subprocess has been signalled by step (c)
+    //    via its job's `CancellationToken`-aware `invoke_processor` call,
+    //    which performs SIGTERM → 5 s grace → SIGKILL on the child's process
+    //    group.  After the 30 s drain window any rows still in `processing`
+    //    (e.g. because a processor swallowed SIGTERM) are reset by recovery
+    //    in step (g) without consuming an `attempts` slot.
 
     // f. Wait for the detection pipeline and scanner to tear down.
     let _ = tokio::time::timeout(Duration::from_secs(5), pipeline_handle).await;

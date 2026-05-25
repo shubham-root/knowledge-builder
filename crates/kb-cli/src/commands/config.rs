@@ -52,15 +52,18 @@ async fn show() -> Result<()> {
 
 /// `kb config path` — print the filesystem path of the TOML config file.
 ///
-/// The file need not exist; this command only reports where Knowledge Builder
-/// *expects* to find it.
+/// Reports whether the file actually exists, so the user can immediately tell
+/// whether their config is being applied or if `kb` is silently falling back
+/// to built-in defaults.
 async fn path() -> Result<()> {
-    let config_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-        .join("knowledge-builder")
-        .join("config.toml");
+    let config_path = kb_core::config::config_file_path();
 
     println!("{}", config_path.display());
+    if config_path.exists() {
+        println!("  (exists — will be loaded)");
+    } else {
+        println!("  (not found — built-in defaults will be used; create this file to override)");
+    }
     Ok(())
 }
 

@@ -3,13 +3,18 @@ Main processing pipeline for the Knowledge Builder processor.
 
 Pipeline steps
 --------------
-a. DETECT   — determine file type from extension and select extractor.
-b. EXTRACT  — call the appropriate extractor (pdf / docx / xlsx / pptx / image).
-c. SYNTHESIZE — send extracted content to an LLM to produce a structured
-               Obsidian markdown note.
-d. PLACE    — determine output paths inside the vault (never inside sources_dir).
-e. WRITE    — write markdown + copy image assets atomically via :class:`AtomicWriter`.
-f. RETURN   — build and return :class:`ProcessorResult`.
+a. DETECT    — determine file type from extension and select extractor.
+b. EXTRACT   — call the appropriate extractor (pdf / docx / xlsx / pptx / image).
+c. STAGE     — write the extracted markdown to ``work_dir/extracted.md`` so
+              the agent's bash tool can `cat` it.  Also copy figure assets
+              into ``work_dir/assets/`` for potential later reference; the
+              agent decides whether to import any of them into the vault.
+d. INTEGRATE — spawn the pi-mediated agent (see kb_processor.agent.rpc_driver),
+              which surveys the vault via the Obsidian CLI through the
+              ``kb-obsidian`` policy wrapper, decides where the new content
+              belongs, and either writes (apply mode) or records a plan
+              (shadow mode).
+e. RETURN    — assemble :class:`ProcessorResult` with plan metadata.
 
 LLM backend selection
 ----------------------
@@ -612,156 +617,328 @@ async def process(
         input_path.name,
     )
 
-    # ── c. SYNTHESIZE ─────────────────────────────────────────────────── #
-    _report("Step 2/4: Synthesizing with LLM...")
-    model: str = os.environ.get("KB_LLM_MODEL", _DEFAULT_LLM_MODEL)
-    image_filenames: list[str] = [img.name for img in extracted.images]
+    # ── c. STAGE ──────────────────────────────────────────────────────── #
+    #
+    # Write the extracted markdown to a deterministic path inside the
+    # per-job ``work_dir`` so the agent's bash tool can ``cat`` it.  This
+    # is the ONLY place the daemon-side processor writes a file outside
+    # the vault; it is intentionally outside ``vault_root`` so it is not
+    # treated as an output and does not need to satisfy the vault-path
+    # invariant.
+    _report("Step 2/3: Staging extracted content for the agent...")
+    extracted_md_path: Path = work_dir / "extracted.md"
 
-    messages = _build_synthesis_prompt(
-        content=extracted.content,
-        source_filename=input_path.name,
-        file_type=input_path.suffix.lstrip(".").upper() or "UNKNOWN",
-        image_filenames=image_filenames,
-        extraction_metadata=extracted.metadata,
-    )
-
-    logger.info("SYNTHESIZE — calling LLM model=%s", model)
-    try:
-        synthesized_markdown, llm_usage = await asyncio.to_thread(
-            _call_llm_sync, messages, model
-        )
-    except LLMAPIError as exc:
-        logger.warning(
-            "LLM synthesis failed (retryable=%s): %s", exc.retryable, exc
-        )
-        return ProcessorResultError(
-            error=f"LLM synthesis failed: {exc}",
-            retryable=exc.retryable,
-            metadata={"step": "synthesize", "model": model},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected LLM synthesis error for %s", input_path)
-        return ProcessorResultError(
-            error=f"Unexpected synthesis error: {type(exc).__name__}: {exc}",
-            retryable=True,
-            metadata={"step": "synthesize", "model": model},
-        )
-
-    if not synthesized_markdown or not synthesized_markdown.strip():
-        logger.warning("LLM returned empty response for %s", input_path)
-        return ProcessorResultError(
-            error="LLM returned an empty response",
-            retryable=True,
-            metadata={"step": "synthesize", "model": model},
-        )
-
-    logger.info(
-        "Synthesis complete — %d chars, usage=%s",
-        len(synthesized_markdown),
-        llm_usage,
-    )
-
-    # ── d. PLACE ──────────────────────────────────────────────────────── #
-    #  Derive category from the LLM's YAML frontmatter, fall back to
-    #  extension-based default.
-    raw_category = _parse_category(synthesized_markdown)
-    if not raw_category:
-        raw_category = _CATEGORY_BY_EXT.get(
-            input_path.suffix.lower(), _DEFAULT_CATEGORY
-        )
-    category: str = _sanitize_dirname(raw_category)
-
-    stem: str = input_path.stem  # source filename without extension
-    note_filename: str = f"{stem}.md"
-    assets_dirname: str = f"{stem}-assets"
-
-    notes_base: Path = vault_root / "Notes" / category
-    note_final_path: Path = notes_base / note_filename
-    assets_dir: Path = notes_base / assets_dirname
-
-    logger.info(
-        "PLACE — category=%r note=%s assets=%s",
-        category,
-        note_final_path,
-        assets_dir,
-    )
-
-    # ── e. WRITE ──────────────────────────────────────────────────────── #
-    _report("Step 3/4: Writing outputs...")
-    logger.info("WRITE — staging %d output(s)", 1 + len(extracted.images))
-
-    writer = AtomicWriter(
-        work_dir=work_dir,
-        vault_root=vault_root,
-        sources_dir=sources_dir,
-    )
-
-    try:
-        # Stage the synthesized markdown note.
-        writer.stage(synthesized_markdown, note_final_path, "markdown")
-
-        # Stage copies of every extracted image asset.
-        for img_path in extracted.images:
-            img_dest: Path = assets_dir / img_path.name
-            writer.stage_copy(img_path, img_dest, "asset")
-
-        # Atomically commit all staged writes into the vault.
-        records = writer.commit()
-
-    except PathViolation as exc:
-        # Output path invariant violated — this is a processor bug, not retryable.
-        logger.error(
-            "Output path invariant violated (BUG) for %s: %s",
-            input_path,
-            exc,
-        )
-        writer.rollback()
-        return ProcessorResultError(
-            error=f"Output path invariant violation (processor bug): {exc}",
-            retryable=False,
-            metadata={"step": "write", "note_path": str(note_final_path)},
-        )
-    except WriteError as exc:
-        logger.warning("Atomic write failed for %s: %s", input_path, exc)
-        writer.rollback()
-        return ProcessorResultError(
-            error=f"Failed to write outputs to vault: {exc}",
-            retryable=True,
-            metadata={"step": "write"},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected write error for %s", input_path)
-        writer.rollback()
-        return ProcessorResultError(
-            error=f"Unexpected write error: {type(exc).__name__}: {exc}",
-            retryable=True,
-            metadata={"step": "write"},
-        )
-
-    # ── f. RETURN ─────────────────────────────────────────────────────── #
-    _report("Step 4/4: Validating...")
-    outputs: list[OutputEntry] = [
-        OutputEntry(path=rec.path, kind=rec.kind, bytes=rec.bytes)
-        for rec in records
+    # Build a small front-matter block so the agent has unambiguous
+    # provenance information at the top of the file it cat()s.
+    fm_lines: list[str] = [
+        "---",
+        f"source_basename: {input_path.name!r}",
+        f"file_type: {input_path.suffix.lstrip('.').upper() or 'UNKNOWN'}",
+        f"extractor: {extractor_name}",
+        f"job_id: {inp.job_id}",
     ]
+    extracted_pages = extracted.metadata.get("page_count")
+    if extracted_pages:
+        fm_lines.append(f"page_count: {extracted_pages}")
+    if extracted.images:
+        fm_lines.append(f"figure_count: {len(extracted.images)}")
+    fm_lines.append("---\n\n")
 
-    # Build metadata: LLM info + token usage + selected extraction metadata.
-    result_metadata: dict[str, Any] = {
-        "model": model,
-        "category": category,
-        "extractor": extractor_name,
+    body = "\n".join(fm_lines) + extracted.content
+    if extracted.images:
+        body += "\n\n## Extracted figures (work_dir copies)\n\n"
+        for img in extracted.images:
+            body += f"- `{img}`\n"
+
+    try:
+        extracted_md_path.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        logger.exception("Failed to stage extracted.md")
+        return ProcessorResultError(
+            error=f"Failed to stage extracted markdown: {exc}",
+            retryable=True,
+            metadata={"step": "stage"},
+        )
+
+    logger.info(
+        "Staged extracted.md (%d bytes, %d figures) at %s",
+        len(body),
+        len(extracted.images),
+        extracted_md_path,
+    )
+
+    # ── d. INTEGRATE ──────────────────────────────────────────────────── #
+    _report("Step 3/3: Integrating into vault via agent...")
+
+    model: str = os.environ.get("KB_LLM_MODEL", _DEFAULT_LLM_MODEL)
+    agent_mode = os.environ.get("KB_AGENT_MODE", "apply").strip().lower()
+    if agent_mode not in ("shadow", "apply"):
+        logger.warning(
+            "KB_AGENT_MODE=%r is invalid; defaulting to 'apply'", agent_mode,
+        )
+        agent_mode = "apply"
+
+    # Lazy-import the agent driver so unrelated unit tests of the pipeline
+    # don't pay its (cheap) import cost or pull in the rpc_driver's
+    # transitive dependencies.
+    from kb_processor.agent import (   # noqa: PLC0415
+        AgentBudgetError,
+        AgentError,
+        AgentInput,
+        MissingApiKeyError,
+        PiNotFoundError,
+        run_agent,
+    )
+
+    try:
+        # Resolve agent_root: prefer the explicit value from ProcessorInput,
+        # fall back to the legacy default `vault_root/KnowledgeBase` so older
+        # daemon builds (without the new field) keep working.
+        agent_root = inp.agent_root
+        if agent_root is None or str(agent_root) in (".", "", "/"):
+            agent_root = vault_root / "KnowledgeBase"
+        # Make sure the directory exists; the daemon should have done this
+        # but processors may run standalone (e.g. from the command line).
+        try:
+            agent_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return ProcessorResultError(
+                error=f"Could not create agent_root {agent_root}: {exc}",
+                retryable=False,
+                metadata={"step": "integrate"},
+            )
+
+        agent_result = await asyncio.to_thread(
+            run_agent,
+            AgentInput(
+                extracted_path  = extracted_md_path,
+                work_dir        = work_dir,
+                vault_root      = vault_root,
+                sources_dir     = sources_dir,
+                agent_root      = agent_root,
+                source_basename = input_path.name,
+                model           = model,
+                job_id          = inp.job_id,
+                mode            = agent_mode,
+            ),
+        )
+    except MissingApiKeyError as exc:
+        logger.error("Agent refused to spawn: %s", exc)
+        return ProcessorResultError(
+            error=f"Agent missing credentials: {exc}",
+            retryable=False,                # operator must add the key
+            metadata={"step": "integrate", "agent_mode": agent_mode},
+        )
+    except PiNotFoundError as exc:
+        logger.error("pi binary missing: %s", exc)
+        return ProcessorResultError(
+            error=f"pi binary not found: {exc}",
+            retryable=False,
+            metadata={"step": "integrate", "agent_mode": agent_mode},
+        )
+    except AgentBudgetError as exc:
+        logger.warning("Agent ran out of budget: %s", exc)
+        return ProcessorResultError(
+            error=f"Agent budget exhausted before producing a plan: {exc}",
+            retryable=True,
+            metadata={"step": "integrate", "agent_mode": agent_mode},
+        )
+    except AgentError as exc:
+        logger.exception("Agent failed")
+        return ProcessorResultError(
+            error=f"Agent error: {type(exc).__name__}: {exc}",
+            retryable=True,
+            metadata={"step": "integrate", "agent_mode": agent_mode},
+        )
+
+    logger.info(
+        "Agent done — turns=%d elapsed=%.1fs %s aborted=%s",
+        agent_result.turns,
+        agent_result.elapsed_secs,
+        agent_result.plan.summary(),
+        agent_result.aborted,
+    )
+
+    # ── d.5 EMPTY-PLAN GUARD ───────────────────────────────────────────── #
+    #
+    # If the agent finished without proposing any mutations, treat that
+    # as a soft failure regardless of mode.  In shadow mode this gives
+    # us a preserved work_dir for postmortem (the daemon's pool retains
+    # work_dir on failure but cleans it on success).  In apply mode it
+    # keeps the row visible in `kb list --status failed` instead of
+    # silently passing.
+    #
+    # `retryable=True` so the standard backoff kicks in; `max_attempts`
+    # in worker config limits the blast radius (default 3 attempts).
+    if len(agent_result.plan) == 0 and not agent_result.aborted:
+        final_text = (agent_result.final_assistant_text or "").strip()
+        excerpt = (final_text[:400] + ("…" if len(final_text) > 400 else "")) if final_text else "(no final assistant message)"
+        logger.warning(
+            "Agent produced an empty plan after %d turn(s); marking as "
+            "retryable failure so the work_dir is preserved.",
+            agent_result.turns,
+        )
+        return ProcessorResultError(
+            error=(
+                f"Agent ran for {agent_result.turns} turn(s) in {agent_mode} "
+                f"mode but proposed no mutations.  Final message: {excerpt}"
+            ),
+            retryable=True,
+            metadata={
+                "step":               "integrate",
+                "reason":             "empty_plan",
+                "agent_mode":         agent_mode,
+                "agent_turns":        agent_result.turns,
+                "agent_elapsed_secs": round(agent_result.elapsed_secs, 2),
+                "agent_log":          str(agent_result.agent_log),
+                "plan_file":          str(agent_result.plan_file),
+                "extracted_md":       str(extracted_md_path),
+                "agent_provider":     agent_result.metadata.get("provider"),
+                "agent_model":        agent_result.metadata.get("model"),
+            },
+        )
+
+    # ── d.5 LINK SWEEP ─────────────────────────────────────────────────── #
+    #
+    # In apply mode, post-process every file the agent created or modified
+    # and replace any unresolved ``[[wikilink]]`` (target note does not
+    # exist) with plain-text ``Target [possible linkout - elaboration
+    # needed]``.  This is the deterministic backstop for the prompt-level
+    # wikilink discipline taught in SKILL.md — a rogue / non-compliant LLM
+    # cannot leave the knowledge graph with dangling links.
+    #
+    # Skipped in shadow mode (nothing has been written yet).
+    # Skipped on empty plans (the empty-plan guard above already
+    # returned ProcessorResultError).
+    sweep_stats_meta: dict[str, object] = {
+        "link_sweep_examined": 0,
+        "link_sweep_modified": 0,
+        "link_sweep_replaced": 0,
     }
-    result_metadata.update(llm_usage)  # tokens_in, tokens_out (when available)
-    # Merge scalar extraction metadata fields (skip nested dicts/lists).
+    if agent_mode == "apply" and len(agent_result.plan) > 0:
+        # Lazy import — keeps the cold-start cost off shadow-only paths.
+        from kb_processor.agent.link_sweeper import (   # noqa: PLC0415
+            files_touched_by_plan,
+            sweep_files,
+        )
+
+        touched = files_touched_by_plan(
+            agent_result.plan.entries, vault_root,
+        )
+        if touched:
+            try:
+                sweep_stats = sweep_files(
+                    files       = touched,
+                    vault_root  = vault_root,
+                    sources_dir = sources_dir,
+                    agent_root  = agent_root,
+                )
+                sweep_stats_meta = sweep_stats.as_metadata()
+                if sweep_stats.links_replaced > 0:
+                    logger.info(
+                        "link_sweep: rewrote %d unresolved link(s) across "
+                        "%d file(s); examples: %s",
+                        sweep_stats.links_replaced,
+                        sweep_stats.files_modified,
+                        sweep_stats.examples[:5],
+                    )
+                else:
+                    logger.info(
+                        "link_sweep: clean (%d file(s) examined, no "
+                        "unresolved wikilinks)",
+                        sweep_stats.files_examined,
+                    )
+            except Exception as exc:    # noqa: BLE001  defensive
+                # The sweeper is best-effort; a failure here should NOT
+                # turn a successful agent run into a job failure.  Log
+                # and surface in metadata.
+                logger.exception("link_sweep: unexpected failure")
+                sweep_stats_meta = {
+                    "link_sweep_examined": 0,
+                    "link_sweep_modified": 0,
+                    "link_sweep_replaced": 0,
+                    "link_sweep_error":    f"{type(exc).__name__}: {exc}",
+                }
+
+    # ── e. RETURN ─────────────────────────────────────────────────────── #
+    #
+    # Output collection differs by mode:
+    #
+    #   shadow → no vault outputs (nothing was actually written).  The
+    #            plan file path lives in metadata for `kb show <id>`.
+    #
+    #   apply  → outputs are the vault paths of the entries the agent
+    #            successfully applied (cmd in {create, append, prepend,
+    #            move, rename}).  We extract them from the plan entries
+    #            so the daemon can record them in `outputs` and reject
+    #            any that violate the vault-path invariant (defence in
+    #            depth — the wrapper already blocked sources_dir paths).
+    outputs: list[OutputEntry] = []
+    if agent_mode == "apply":
+        for entry in agent_result.plan.entries:
+            if not entry.applied:
+                continue
+            # Pull `path=` first; some commands use `file=` only.
+            kv: dict[str, str] = {}
+            for tok in entry.args:
+                eq = tok.find("=")
+                if eq > 0:
+                    kv[tok[:eq]] = tok[eq + 1:]
+            raw = kv.get("path") or kv.get("to") or kv.get("file") or ""
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = vault_root / p
+            try:
+                size_bytes = p.stat().st_size if p.exists() else 0
+            except OSError:
+                size_bytes = 0
+            outputs.append(OutputEntry(
+                path  = str(p),
+                kind  = entry.kind,        # "create" | "append" | "rename" | …
+                bytes = size_bytes,
+            ))
+
+    result_metadata: dict[str, Any] = {
+        "extractor":           extractor_name,
+        "model":               model,
+        "agent_mode":          agent_mode,
+        "agent_turns":         agent_result.turns,
+        "agent_elapsed_secs":  round(agent_result.elapsed_secs, 2),
+        "agent_aborted":       agent_result.aborted,
+        "plan_file":           str(agent_result.plan_file),
+        "agent_log":           str(agent_result.agent_log),
+        "plan_summary":        agent_result.plan.summary(),
+        "plan_entry_count":    len(agent_result.plan),
+        "extracted_md":        str(extracted_md_path),
+        "rogue_writes_count":  len(agent_result.rogue_writes),
+        "rogue_writes":        [str(p) for p in agent_result.rogue_writes[:20]],
+        # Tell the daemon's worker pool to retain the work_dir on success
+        # when running in shadow mode — the plan file lives there and the
+        # operator needs to be able to read it via `kb show`.  Apply mode
+        # mutations are durable in the vault, so retention is unnecessary
+        # there and the work_dir can be cleaned as usual.
+        "retain_work_dir":     (agent_mode == "shadow"),
+        # Link-sweep results: how many unresolved wikilinks the post-run
+        # sweeper rewrote to placeholder text.  Always present; zeros in
+        # shadow mode and on empty plans.
+        **sweep_stats_meta,
+    }
+    if agent_result.final_assistant_text:
+        # Cap so a chatty model doesn't blow processor_meta size.
+        result_metadata["agent_final_text"] = agent_result.final_assistant_text[:4000]
+    # Inherit agent-side metadata (provider, model, mode).
+    for k, v in agent_result.metadata.items():
+        result_metadata.setdefault(f"agent_{k}", v)
+    # Carry forward useful scalar extraction metadata.
     for k, v in extracted.metadata.items():
         if isinstance(v, (str, int, float, bool)):
-            result_metadata[k] = v
+            result_metadata.setdefault(k, v)
 
     logger.info(
-        "Pipeline complete — job_id=%d wrote %d output(s): %s",
-        inp.job_id,
-        len(outputs),
-        [str(o.path) for o in outputs],
+        "Pipeline complete — job_id=%d mode=%s plan_entries=%d outputs=%d",
+        inp.job_id, agent_mode, len(agent_result.plan), len(outputs),
     )
 
     return ProcessorResultOk(outputs=outputs, metadata=result_metadata)

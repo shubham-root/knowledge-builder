@@ -136,6 +136,14 @@ pub(crate) fn render_file_detail(
     println!("  {:<LBL$}  {}", "Last error:", error_display);
     println!();
 
+    // ── Agent plan (when a `plan_file` is present in processor_meta) ───────────────
+    //
+    // The processor records the path to the agent's `.kb-plan.jsonl` in
+    // `processor_meta`.  Read it here so the operator can inspect what the
+    // agent decided (or proposed in shadow mode) without having to dig into
+    // ~/Library/Caches/knowledge-builder/jobs/<...>/.kb-plan.jsonl manually.
+    print_agent_plan_section(file_row.processor_meta.as_deref());
+
     // ── Outputs ───────────────────────────────────────────────────────────────
     println!("  Outputs ({}):", outputs.len());
     println!("  {SEP}");
@@ -249,4 +257,153 @@ async fn _resolve_target_db(
          Use `kb list` to see tracked files, or provide a numeric ID.",
         target
     )
+}
+
+// ── Agent plan section ───────────────────────────────────────────────────────
+
+/// Render the agent-produced plan section.
+///
+/// Reads `processor_meta` (a JSON string column on `files`), pulls out the
+/// agent-related keys, and if there is a `plan_file` reference also tries
+/// to read+parse the `.kb-plan.jsonl` file the wrapper wrote during the
+/// run.  Prints nothing when the file row has no agent metadata at all
+/// (e.g. legacy rows from before the agent was wired in, or rows where
+/// the agent never ran).
+fn print_agent_plan_section(processor_meta: Option<&str>) {
+    use serde_json::Value;
+    use std::path::Path;
+
+    const LBL: usize = 16;
+    const SEP: &str = "───────────────────────────────────────────────────────────────────────";
+
+    // No metadata → nothing to render.  This is the common case for pre-agent
+    // jobs and we deliberately stay silent rather than printing a header that
+    // would be empty.
+    let raw = match processor_meta {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return, // unparseable; not our problem to surface here
+    };
+
+    // Only render when at least one agent_* field is present.
+    let mode  = v.get("agent_mode").and_then(Value::as_str);
+    let plan  = v.get("plan_file").and_then(Value::as_str);
+    let summary = v.get("plan_summary").and_then(Value::as_str);
+    let turns = v.get("agent_turns").and_then(Value::as_u64);
+    let elapsed = v.get("agent_elapsed_secs").and_then(Value::as_f64);
+    let aborted = v.get("agent_aborted").and_then(Value::as_bool).unwrap_or(false);
+
+    if mode.is_none() && plan.is_none() && summary.is_none() {
+        return;
+    }
+
+    println!("  Agent plan:");
+    println!("  {SEP}");
+
+    if let Some(m) = mode {
+        let badge = match m {
+            "shadow" => "shadow (no vault writes)",
+            "apply"  => "apply  (writes committed)",
+            other    => other,
+        };
+        println!("  {:<LBL$}  {}", "Mode:", badge);
+    }
+    if aborted {
+        println!("  {:<LBL$}  yes (budget exhausted before completion)", "Aborted:");
+    }
+    if let (Some(t), Some(e)) = (turns, elapsed) {
+        println!("  {:<LBL$}  {} turns, {:.1}s", "LLM activity:", t, e);
+    }
+    if let Some(s) = summary {
+        println!("  {:<LBL$}  {}", "Summary:", s);
+    }
+    if let Some(p) = plan {
+        println!("  {:<LBL$}  {}", "Plan file:", p);
+    }
+
+    // Loud rogue-write warning when the audit found anything.
+    let rogue_count = v.get("rogue_writes_count").and_then(Value::as_u64).unwrap_or(0);
+    if rogue_count > 0 {
+        println!("  {:<LBL$}  ⚠️  {} rogue write(s) (agent bypassed kb-obsidian)",
+                 "Audit:", rogue_count);
+        if let Some(arr) = v.get("rogue_writes").and_then(Value::as_array) {
+            for entry in arr.iter().take(10) {
+                if let Some(s) = entry.as_str() {
+                    println!("    ⚠  {s}");
+                }
+            }
+        }
+    }
+    if let Some(s) = v.get("agent_final_text").and_then(Value::as_str) {
+        // Indent the final assistant message so it's visibly separate.
+        println!("  Final summary from the agent:");
+        for line in s.lines().take(20) {
+            println!("    {line}");
+        }
+        if s.lines().count() > 20 {
+            println!("    … ({} more lines elided; cat the plan file for full)",
+                     s.lines().count() - 20);
+        }
+    }
+
+    // Render plan entries when we can read the file.
+    if let Some(p) = plan {
+        let path = Path::new(p);
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let entries: Vec<&str> = content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if !entries.is_empty() {
+                    println!("  Plan entries ({}):", entries.len());
+                    for (i, line) in entries.iter().enumerate().take(20) {
+                        match serde_json::from_str::<Value>(line) {
+                            Ok(j) => {
+                                let cmd = j.get("cmd").and_then(Value::as_str).unwrap_or("?");
+                                let mode_e = j.get("mode").and_then(Value::as_str).unwrap_or("?");
+                                let applied = j.get("applied").and_then(Value::as_bool).unwrap_or(false);
+                                let args: Vec<String> = j.get("args")
+                                    .and_then(Value::as_array)
+                                    .map(|a| a.iter()
+                                        .filter_map(|x| x.as_str().map(|s| {
+                                            // Truncate very long content= values to keep the
+                                            // table readable.
+                                            if s.len() > 80 { format!("{}…", &s[..80]) } else { s.to_string() }
+                                        }))
+                                        .collect())
+                                    .unwrap_or_default();
+                                let badge = if applied { "✓" } else { "·" };
+                                println!(
+                                    "    {} {:>3}. [{}] {}  {}",
+                                    badge,
+                                    i + 1,
+                                    mode_e,
+                                    cmd,
+                                    args.join("  "),
+                                );
+                            }
+                            Err(_) => {
+                                println!("    · {:>3}. (unparseable line: {})", i + 1, line);
+                            }
+                        }
+                    }
+                    if entries.len() > 20 {
+                        println!("    … {} more entries (read the plan file for full)",
+                                 entries.len() - 20);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  (plan file unreadable: {e})");
+            }
+        }
+    }
+
+    println!();
 }

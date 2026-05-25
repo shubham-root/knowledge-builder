@@ -18,6 +18,7 @@ pub mod lock;
 pub mod logging;
 pub mod migrations;
 pub mod paths;
+pub mod secrets;
 pub mod state;
 pub mod tracing_setup;
 pub mod types;
@@ -92,5 +93,14 @@ pub use config::{
     WorkerConfig,
     ProcessorConfig,
     OpsConfig,
+    config_file_path,
     load_raw,
+};
+
+pub use secrets::{
+    load_secrets,
+    load_secrets_from,
+    secrets_file_path,
+    SecretsError,
+    SecretsLoad,
 };

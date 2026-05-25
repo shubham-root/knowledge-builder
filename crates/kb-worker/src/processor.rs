@@ -21,6 +21,11 @@
 //! 2. 5-second grace period.
 //! 3. `SIGKILL` sent unconditionally.
 //! 4. Returns [`ProcessorError::Timeout`].
+//!
+//! The same SIGTERM → grace → SIGKILL escalation runs when the daemon-wide
+//! [`tokio_util::sync::CancellationToken`] passed into [`invoke_processor`]
+//! is cancelled (e.g. on Ctrl-C).  This guarantees no processor subprocesses
+//! survive the daemon and become orphans (PPID=1) consuming CPU after exit.
 
 use std::io;
 use std::path::Path;
@@ -32,6 +37,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::process::Child;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -62,6 +68,14 @@ pub enum ProcessorError {
     /// The process did not finish within the allocated time.
     #[error("processor timed out after {elapsed_secs}s")]
     Timeout { elapsed_secs: u64 },
+
+    /// The daemon-wide [`CancellationToken`] fired while the subprocess was
+    /// running (e.g. Ctrl-C).  The process group has already been signalled
+    /// and reaped; the worker should leave the job row in `processing` so
+    /// shutdown-time crash recovery resets it to `queued` for retry on next
+    /// start (no `attempts` increment).
+    #[error("processor cancelled by daemon shutdown")]
+    Cancelled,
 
     /// The process could not be spawned at all (executable not found, bad
     /// permissions, etc.).
@@ -103,18 +117,34 @@ pub enum ProcessorError {
 ///                     as the second positional argument to the processor.
 /// * `timeout_secs`  — Hard wall-clock timeout.  On expiry: `SIGTERM` → 5 s
 ///                     grace → `SIGKILL`.
+/// * `extra_env`     — Additional environment variables to inject into the
+///                     subprocess (typically secrets loaded from
+///                     `~/.config/knowledge-builder/secrets.env`).  Applied
+///                     via `Command::envs` *after* the inherited daemon
+///                     environment, so these values take precedence.
+/// * `agent_root`    — Knowledge Builder's mutation root.  Exported as
+///                     ``KB_AGENT_ROOT`` so the kb-obsidian wrapper can
+///                     enforce the policy that all writes resolve under
+///                     this tree.
+/// * `cancel_token`  — Daemon-wide shutdown token.  When cancelled while the
+///                     subprocess is running, the same escalation as the
+///                     timeout path runs immediately and
+///                     [`ProcessorError::Cancelled`] is returned.
 ///
 /// # Returns
 ///
 /// A [`ProcessorOutput`] on success (even if the processor reported
 /// `status: "error"` in its JSON — that is a *job* error, not an invocation
 /// error).  A [`ProcessorError`] if the subprocess couldn't be spawned, timed
-/// out, or produced no parseable JSON.
+/// out, was cancelled, or produced no parseable JSON.
 pub async fn invoke_processor(
     command: &str,
     input: &ProcessorInput,
     work_dir: &Path,
     timeout_secs: u64,
+    extra_env: &std::collections::BTreeMap<String, String>,
+    agent_root: &Path,
+    cancel_token: CancellationToken,
 ) -> Result<ProcessorOutput, ProcessorError> {
     // ── (a) Ensure work directory exists ──────────────────────────────────
     tokio::fs::create_dir_all(work_dir).await?;
@@ -138,6 +168,17 @@ pub async fn invoke_processor(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .current_dir(work_dir);
+
+    // Inject secrets / per-processor env from the daemon's secrets file.
+    // `Command::envs` adds to (and overrides) the inherited environment, so
+    // the daemon's own env is preserved and any matching keys are replaced.
+    if !extra_env.is_empty() {
+        cmd.envs(extra_env.iter());
+    }
+
+    // Export ``KB_AGENT_ROOT`` so the kb-obsidian wrapper inside the
+    // processor can enforce the agent's mutation-confinement policy.
+    cmd.env("KB_AGENT_ROOT", agent_root.as_os_str());
 
     // Put the child in its own process group so we can kill the whole tree.
     #[cfg(unix)]
@@ -173,40 +214,70 @@ pub async fn invoke_processor(
     let stdout_handle = child.stdout.take().expect("stdout should be piped");
     let stderr_handle = child.stderr.take().expect("stderr should be piped");
 
-    // ── (d–f) Read output with timeout ────────────────────────────────────
-    let io_result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        read_child_output(stdout_handle, stderr_handle, &mut child),
-    )
-    .await;
+    // ── (d–f) Read output, racing against (i) timeout and (ii) cancellation ──
+    //
+    // Either condition triggers the same SIGTERM → 5 s grace → SIGKILL
+    // escalation against the child's process group.  The select! is `biased`
+    // so cancellation always wins over a near-simultaneous timeout, giving
+    // the cleanest semantics for graceful shutdown.
+    //
+    // The select! lives inside an inner block so that `read_fut` (which holds
+    // a `&mut child` borrow) is dropped before the outer match calls
+    // `terminate_child_group(&mut child, …)`.  Without this scoping the
+    // borrow checker rejects the second `&mut child`.
+    enum ReadOutcome {
+        Done((Vec<String>, String, i32)),
+        IoError(io::Error),
+        Timeout,
+        Cancelled,
+    }
 
-    let (stdout_lines, stderr_str, exit_code) = match io_result {
-        Ok(Ok(triple)) => triple,
-        Ok(Err(io_err)) => return Err(ProcessorError::IoError(io_err)),
+    let outcome = {
+        let read_fut = read_child_output(stdout_handle, stderr_handle, &mut child);
+        tokio::pin!(read_fut);
+
+        tokio::select! {
+            biased;
+
+            _ = cancel_token.cancelled() => {
+                ReadOutcome::Cancelled
+            }
+            res = tokio::time::timeout(Duration::from_secs(timeout_secs), &mut read_fut) => {
+                match res {
+                    Ok(Ok(triple))  => ReadOutcome::Done(triple),
+                    Ok(Err(io_err)) => ReadOutcome::IoError(io_err),
+                    Err(_elapsed)   => ReadOutcome::Timeout,
+                }
+            }
+        }
+        // `read_fut` (and the `&mut child` it held) is dropped here.
+    };
+
+    let (stdout_lines, stderr_str, exit_code) = match outcome {
+        ReadOutcome::Done(triple)    => triple,
+        ReadOutcome::IoError(io_err) => return Err(ProcessorError::IoError(io_err)),
 
         // ── Timeout path ──────────────────────────────────────────────────
-        Err(_elapsed) => {
+        ReadOutcome::Timeout => {
             error!(
                 timeout_secs,
                 pid = child_pid,
                 "processor timed out — sending SIGTERM to process group"
             );
-
-            #[cfg(unix)]
-            kill_process_group(child_pid, libc::SIGTERM);
-
-            // Grace period.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            #[cfg(unix)]
-            kill_process_group(child_pid, libc::SIGKILL);
-
-            // Reap the zombie / wait to unblock tokio's process watcher.
-            let _ = child.wait().await;
-
+            terminate_child_group(child_pid, &mut child).await;
             return Err(ProcessorError::Timeout {
                 elapsed_secs: timeout_secs,
             });
+        }
+
+        // ── Cancellation path (daemon shutdown) ───────────────────────────
+        ReadOutcome::Cancelled => {
+            error!(
+                pid = child_pid,
+                "daemon shutdown requested — sending SIGTERM to processor process group"
+            );
+            terminate_child_group(child_pid, &mut child).await;
+            return Err(ProcessorError::Cancelled);
         }
     };
 
@@ -353,11 +424,46 @@ fn kill_process_group(pgid: i32, signal: libc::c_int) {
     let ret = unsafe { libc::killpg(pgid, signal) };
     if ret != 0 {
         let err = io::Error::last_os_error();
-        // ESRCH just means the process already exited — not an error.
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            warn!(pgid, signal, error = %err, "killpg failed");
+        match err.raw_os_error() {
+            // ESRCH — the process group has already been reaped.  Expected
+            // and harmless when SIGTERM during the timeout / cancellation
+            // path completed before the SIGKILL grace expired.
+            Some(libc::ESRCH) => {}
+            // EPERM — same scenario as ESRCH on macOS when the PID has been
+            // recycled to a process owned by another user (or the kernel)
+            // between our SIGTERM and SIGKILL.  Logging this as a warning
+            // creates noise but is also harmless: by definition there is
+            // no process of ours left to kill.
+            Some(libc::EPERM) => {
+                debug!(
+                    pgid,
+                    signal,
+                    "killpg returned EPERM — process group already reaped or PID recycled",
+                );
+            }
+            _ => {
+                warn!(pgid, signal, error = %err, "killpg failed");
+            }
         }
     }
+}
+
+/// Escalating termination of `child`'s process group.
+///
+/// Sends `SIGTERM` immediately, sleeps 5 s, then sends `SIGKILL`
+/// unconditionally, and finally `wait()`s the child to reap the zombie and
+/// unblock tokio's process watcher.
+///
+/// Used by both the timeout path and the cancellation path so the escalation
+/// is identical and exists in exactly one place.
+async fn terminate_child_group(child_pid: i32, child: &mut Child) {
+    #[cfg(unix)]
+    {
+        kill_process_group(child_pid, libc::SIGTERM);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        kill_process_group(child_pid, libc::SIGKILL);
+    }
+    let _ = child.wait().await;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -373,6 +479,7 @@ mod tests {
             content_hash: "sha256:deadbeef".to_string(),
             vault_root: PathBuf::from("/vault"),
             sources_dir: PathBuf::from("/vault/sources"),
+            agent_root: PathBuf::from("/vault/KnowledgeBase"),
             work_dir: PathBuf::from("/tmp/kb-jobs/test"),
             job_id: 1,
             attempt: 1,
@@ -489,6 +596,9 @@ mod tests {
             &input,
             &work,
             30,
+            &Default::default(),
+            std::path::Path::new("/tmp"),
+            CancellationToken::new(),
         )
         .await
         .expect("invoke_processor should succeed");
@@ -514,7 +624,7 @@ mod tests {
             std::fs::set_permissions(&script, perms).unwrap();
         }
         let input = make_input();
-        let err = invoke_processor(script.to_str().unwrap(), &input, &work, 30)
+        let err = invoke_processor(script.to_str().unwrap(), &input, &work, 30, &Default::default(), std::path::Path::new("/tmp"), CancellationToken::new())
             .await
             .expect_err("should fail with NonZeroExit");
         assert!(matches!(err, ProcessorError::NonZeroExit { code: 1, .. }));
@@ -536,7 +646,7 @@ mod tests {
             std::fs::set_permissions(&script, perms).unwrap();
         }
         let input = make_input();
-        let err = invoke_processor(script.to_str().unwrap(), &input, &work, 1)
+        let err = invoke_processor(script.to_str().unwrap(), &input, &work, 1, &Default::default(), std::path::Path::new("/tmp"), CancellationToken::new())
             .await
             .expect_err("should time out");
         assert!(matches!(err, ProcessorError::Timeout { elapsed_secs: 1 }));
@@ -548,10 +658,66 @@ mod tests {
         let work = tmp.path().join("work");
         let input = make_input();
         let err =
-            invoke_processor("/nonexistent/proc", &input, &work, 30)
+            invoke_processor("/nonexistent/proc", &input, &work, 30, &Default::default(), std::path::Path::new("/tmp"), CancellationToken::new())
                 .await
                 .expect_err("nonexistent command should fail");
         assert!(matches!(err, ProcessorError::SpawnFailed { .. }));
+    }
+
+    /// Regression test for the orphan-process bug:
+    /// when the daemon-wide `CancellationToken` fires while a long-running
+    /// processor is in-flight, `invoke_processor` must terminate the child's
+    /// process group and return `ProcessorError::Cancelled` — *not* leave the
+    /// subprocess running until its `timeout_secs` expires.
+    #[tokio::test]
+    async fn invoke_processor_cancelled_on_shutdown() {
+        let tmp    = tempfile::tempdir().expect("tempdir");
+        let work   = tmp.path().join("work");
+        let script = tmp.path().join("slow.sh");
+        // Sleep long enough that the test can never pass via the timeout path.
+        tokio::fs::write(&script, b"#!/bin/sh\nsleep 600\n").await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        let input = make_input();
+        let token = CancellationToken::new();
+        // Fire cancellation 200 ms after the call begins.
+        let token_for_canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            token_for_canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = invoke_processor(
+            script.to_str().unwrap(),
+            &input,
+            &work,
+            // 600 s timeout — if cancellation didn't work this test would hang.
+            600,
+            &Default::default(),
+            std::path::Path::new("/tmp"),
+            token,
+        )
+        .await
+        .expect_err("should be cancelled");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, ProcessorError::Cancelled),
+            "expected ProcessorError::Cancelled, got: {err:?}"
+        );
+        // 200 ms wait + up to 5 s SIGTERM grace + a small fudge factor.
+        // If the implementation regresses and lets the child run to its own
+        // timeout, this elapsed time would balloon to >= 600 s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "cancellation took too long: {elapsed:?} — likely waiting for child timeout"
+        );
     }
 
     #[tokio::test]
@@ -576,7 +742,7 @@ mod tests {
             std::fs::set_permissions(&script, perms).unwrap();
         }
         let input = make_input();
-        invoke_processor(script.to_str().unwrap(), &input, &work, 30)
+        invoke_processor(script.to_str().unwrap(), &input, &work, 30, &Default::default(), std::path::Path::new("/tmp"), CancellationToken::new())
             .await
             .expect("should succeed");
         assert!(work.exists(), "work_dir should have been created");

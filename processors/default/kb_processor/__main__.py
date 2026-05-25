@@ -35,6 +35,41 @@ Exit codes
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# MPS × float64 fallback
+#
+# Apple's MPS backend does not support ``float64`` tensors, but docling's
+# layout detector (``RT-DETR v2`` via ``transformers``) allocates float64
+# tensors for position embeddings.  Without the fallback flag, every page of
+# every PDF crashes with ``TypeError: Cannot convert a MPS Tensor to float64
+# dtype …``.
+#
+# This MUST be set before *any* torch import anywhere in the process; doing
+# it at the very top of the entry-point module is the safest place.
+# ---------------------------------------------------------------------------
+import os as _os
+_os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# ---------------------------------------------------------------------------
+# litellm noise suppression
+#
+# litellm pre-loads codecs for every provider it supports (Bedrock,
+# SageMaker, Vertex AI, Azure, ...).  If ``botocore`` is not installed
+# in the venv, the Bedrock and SageMaker pre-loads emit WARNING-level
+# messages on every import.  We're not using those providers, so the
+# warnings are pure noise that ends up in the daemon's stderr capture.
+#
+# litellm uses Python's standard logging under the logger name
+# ``LiteLLM``.  Raising its level to ERROR before importing litellm
+# silences these without affecting real failures (which log at ERROR
+# or above).  The operator can re-enable verbose litellm output by
+# setting ``LITELLM_LOG_LEVEL=DEBUG`` in secrets.env.
+# ---------------------------------------------------------------------------
+import logging as _logging
+_logging.getLogger("LiteLLM").setLevel(
+    _os.environ.get("LITELLM_LOG_LEVEL", "ERROR").upper()
+)
+
 import asyncio
 import json
 import logging

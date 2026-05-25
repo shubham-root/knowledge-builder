@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use kb_core::{StateStore, EnqueueOutcome, Status};
 use kb_core::config::ProcessorConfig;
 use kb_worker::process_job;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn test_full_pipeline_happy_path() {
@@ -43,7 +44,7 @@ async fn test_full_pipeline_happy_path() {
         work_dir_root: work_dir.to_string_lossy().to_string(),
     };
     
-    let result = process_job(job.clone(), state.clone(), &config, &vault_root, &sources_dir).await;
+    let result = process_job(job.clone(), state.clone(), &config, &Default::default(), &vault_root, &sources_dir, std::path::Path::new("/tmp"), CancellationToken::new()).await;
     assert!(result.is_ok(), "process_job failed: {:?}", result.err());
     
     // Verify done
@@ -101,7 +102,7 @@ async fn test_bad_path_processor_fails_non_retryable() {
         work_dir_root: work_dir.to_string_lossy().to_string(),
     };
     
-    let result = process_job(job.clone(), state.clone(), &config, &vault_root, &sources_dir).await;
+    let result = process_job(job.clone(), state.clone(), &config, &Default::default(), &vault_root, &sources_dir, std::path::Path::new("/tmp"), CancellationToken::new()).await;
     assert!(result.is_ok());
     
     // File should be FAILED (non-retryable) because output was inside sources_dir
@@ -147,7 +148,7 @@ async fn test_error_processor_retries_with_backoff() {
         work_dir_root: work_dir.to_string_lossy().to_string(),
     };
     
-    let result = process_job(job.clone(), state.clone(), &config, &vault_root, &sources_dir).await;
+    let result = process_job(job.clone(), state.clone(), &config, &Default::default(), &vault_root, &sources_dir, std::path::Path::new("/tmp"), CancellationToken::new()).await;
     assert!(result.is_ok());
     
     // Retryable error + available backoff slot → re-queued with future next_attempt_at
@@ -192,7 +193,7 @@ async fn test_dedup_prevents_reprocessing() {
         timeout_secs: 30,
         work_dir_root: work_dir.to_string_lossy().to_string(),
     };
-    process_job(job, state.clone(), &config, &vault_root, &sources_dir).await.unwrap();
+    process_job(job, state.clone(), &config, &Default::default(), &vault_root, &sources_dir, std::path::Path::new("/tmp"), CancellationToken::new()).await.unwrap();
     
     // Second file with same hash → SkippedDuplicate
     let outcome2 = state.process_stable_file(file_b.clone(), 12, 100, 2, hash.clone()).await.unwrap();

@@ -23,9 +23,23 @@ pub async fn run() -> Result<()> {
     let mut checker = Checker::new();
 
     // ── Step 1: parse + tilde-expand the config file ──────────────────────────
+    let config_path = kb_core::config::config_file_path();
+    if config_path.exists() {
+        checker.pass(&format!(
+            "Config file found at {}",
+            config_path.display()
+        ));
+    } else {
+        checker.warn(format!(
+            "No config file at {} — using built-in defaults. \
+             Create this file to override.",
+            config_path.display()
+        ));
+    }
+
     let config = match kb_core::config::load_raw() {
         Ok(c) => {
-            checker.pass("Config file parsed successfully.");
+            checker.pass("Config parsed successfully.");
             c
         }
         Err(e) => {
@@ -123,6 +137,52 @@ pub async fn run() -> Result<()> {
             checker.pass(&format!(
                 "Last backup is {days} day(s) old — within the 7-day window."
             ));
+        }
+    }
+
+    // ── Step 6: secrets file health ──────────────────────────────────────
+    //
+    // `~/.config/knowledge-builder/secrets.env` is where credentials such as
+    // `OPENROUTER_API_KEY` live.  We print only the keys (never the values),
+    // so the operator can confirm what is in scope without leaking secrets
+    // to the terminal scrollback.
+    match kb_core::load_secrets() {
+        Ok(s) if !s.loaded => {
+            let dir = s.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+            checker.warn(format!(
+                "No secrets file at {}.\n\
+                 \t   The processor will only see the daemon's inherited environment.\n\
+                 \t   To add credentials, run:\n\
+                 \t     mkdir -p {dir} && touch {p} && chmod 600 {p}",
+                s.path.display(),
+                dir = dir,
+                p   = s.path.display(),
+            ));
+        }
+        Ok(s) => {
+            if s.insecure_perms {
+                checker.fail(format!(
+                    "Secrets file '{}' has permissive mode {:o}.\n\
+                     \t   Run: chmod 600 '{}'",
+                    s.path.display(),
+                    s.mode.unwrap_or(0),
+                    s.path.display(),
+                ));
+            } else if s.entries.is_empty() {
+                checker.warn(format!(
+                    "Secrets file '{}' exists but is empty.",
+                    s.path.display(),
+                ));
+            } else {
+                checker.pass(&format!(
+                    "Secrets file readable with {} key(s): {:?}",
+                    s.entries.len(),
+                    s.keys(),
+                ));
+            }
+        }
+        Err(e) => {
+            checker.fail(format!("Cannot read secrets file: {e}"));
         }
     }
 
