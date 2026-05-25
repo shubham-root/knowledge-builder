@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kb_core::{
-    config::ProcessorConfig,
+    config::{ExtractionConfig, ProcessorConfig},
     event_kind,
     state::StateStore,
     FileRow, ProcessOutput, ProcessResult, ProcessorInput,
@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    processor::{invoke_processor, ProcessorError},
+    pipeline::run_pipeline,
     validate::validate_processor_outputs,
 };
 
@@ -93,14 +93,16 @@ const METRIC_PROCESSOR_DURATION: &str = "kb_processor_duration_seconds";
 /// has already been transitioned to a terminal state.  Under normal operation
 /// (including processor failures) the function returns `Ok(())`.
 //
-// SECURITY: `extra_env` and `cancel_token` are explicitly skipped from span
-// fields.  `extra_env` carries credentials (OPENROUTER_API_KEY, etc.) loaded
+// SECURITY: `extraction` and `cancel_token` are explicitly skipped from
+// span fields.  `extraction` carries no secrets but the daemon-wide
+// log noise reduction matters.  `cancel_token` is skipped because its
+// Debug impl adds no operational value.
 // from `~/.config/knowledge-builder/secrets.env`; without this skip the
 // `tracing` JSON formatter would serialise the entire map into every span
 // entry written to disk.  `cancel_token` is skipped because its Debug impl
 // adds no operational value.
 #[instrument(
-    skip(state, config, extra_env, cancel_token),
+    skip(state, config, extraction, cancel_token),
     fields(
         job_id = job.id,
         path   = %job.path.display(),
@@ -110,12 +112,13 @@ pub async fn process_job(
     job:          FileRow,
     state:        StateStore,
     config:       &ProcessorConfig,
-    extra_env:    &std::collections::BTreeMap<String, String>,
+    extraction:   &ExtractionConfig,
     vault_root:   &Path,
     sources_dir:  &Path,
     agent_root:   &Path,
     cancel_token: CancellationToken,
 ) -> kb_core::Result<()> {
+    let _ = cancel_token; // cooperative cancellation TODO Session B follow-up
     // ── (a) Build the per-job work directory path ─────────────────────────
     //
     // Format: <work_dir_root>/<first12-hex-of-hash>-<job_id>/
@@ -138,8 +141,7 @@ pub async fn process_job(
     tracing::debug!(
         job_id   = job.id,
         work_dir = %work_dir.display(),
-        command  = %config.command,
-        "process_job: beginning pipeline",
+        "process_job: beginning in-process pipeline",
     );
 
     // ── (b) Build ProcessorInput ──────────────────────────────────────────
@@ -157,7 +159,6 @@ pub async fn process_job(
     // ── (c) Audit event: processor_started ───────────────────────────────
     {
         let detail = serde_json::json!({
-            "command":  &config.command,
             "work_dir": work_dir.display().to_string(),
             "attempt":  job.attempts,
             "hash":     job.content_hash.as_deref().unwrap_or("<none>"),
@@ -189,174 +190,107 @@ pub async fn process_job(
         }
     }
 
-    // ── (d) Invoke the processor subprocess ──────────────────────────────
+    // ── (d) Run the in-process pipeline (extract → agent → sweep) ───────
     //
-    // `invoke_processor` handles:
-    //   • creating the work_dir,
-    //   • serialising `input` as JSON on stdin,
-    //   • enforcing `timeout_secs` with SIGTERM → (5 s grace) → SIGKILL,
-    //   • capturing stdout line-by-line,
-    //   • parsing the last non-empty stdout line as a `ProcessResult`.
+    // No subprocess is spawned: kb-extractor + kb-agent run inside the
+    // daemon's own process.  Per-call wall-clock budget is the agent
+    // timeout configured on the agent driver via `KB_AGENT_TIMEOUT_SECS`,
+    // defaulting to `processor.timeout_secs` from config.
+    if config.timeout_secs > 0 {
+        // SAFETY: tests + daemon startup are single-threaded at this
+        // point in the lifecycle; only one process_job per job.
+        unsafe {
+            std::env::set_var("KB_AGENT_TIMEOUT_SECS", config.timeout_secs.to_string());
+        }
+    }
     let processor_start = std::time::Instant::now();
-    let invoke_result = invoke_processor(
-        &config.command,
-        &input,
-        &work_dir,
-        config.timeout_secs,
-        extra_env,
-        agent_root,
-        cancel_token.clone(),
-    )
-    .await;
+    let pipeline_result: ProcessResult = run_pipeline(&input, extraction).await;
     let processor_elapsed = processor_start.elapsed().as_secs_f64();
-    // Record processor wall-clock time regardless of outcome.
     metrics::histogram!(METRIC_PROCESSOR_DURATION).record(processor_elapsed);
 
     // ── (e–g) Handle the outcome ──────────────────────────────────────────
-    // Default: clean work_dir on success.  The processor can override
-    // this by setting `retain_work_dir: true` in its result metadata
-    // (e.g. shadow-mode runs preserve the .kb-plan.jsonl for `kb show`).
     let mut retain_work_dir_on_success: bool = false;
 
-    let job_succeeded: bool = match invoke_result {
-        // ─── Subprocess completed — inspect the ProcessResult ─────────────
-        Ok(processor_output) => {
-            match processor_output.result {
-                // ── (e) ProcessResult::Ok — validate outputs then mark done ─
-                ProcessResult::Ok { outputs, metadata } => {
-                    // Extract retain-flag BEFORE `metadata` is moved into
-                    // `state.mark_done(…)` below.
-                    if let Some(meta) = metadata.as_ref() {
-                        if let Some(flag) = meta.get("retain_work_dir").and_then(|v| v.as_bool()) {
-                            retain_work_dir_on_success = flag;
+    let job_succeeded: bool = match pipeline_result {
+        // ── (e) ProcessResult::Ok — validate outputs then mark done ─────
+        ProcessResult::Ok { outputs, metadata } => {
+            if let Some(meta) = metadata.as_ref() {
+                if let Some(flag) = meta.get("retain_work_dir").and_then(|v| v.as_bool()) {
+                    retain_work_dir_on_success = flag;
+                }
+            }
+            match validate_processor_outputs(&outputs, vault_root, sources_dir) {
+                Ok(canonical_paths) => {
+                    let records: Vec<ProcessOutput> = outputs
+                        .iter()
+                        .zip(canonical_paths.iter())
+                        .map(|(orig, canon)| ProcessOutput {
+                            path:  canon.clone(),
+                            kind:  orig.kind.clone(),
+                            bytes: orig.bytes,
+                        })
+                        .collect();
+
+                    let outputs_count = records.len();
+
+                    match state.mark_done(job.id, records, metadata).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                job_id        = job.id,
+                                outputs_count = outputs_count,
+                                "job completed successfully",
+                            );
+                            metrics::counter!(METRIC_PROCESSED_TOTAL).increment(1);
+                            true
                         }
-                    }
-                    match validate_processor_outputs(&outputs, vault_root, sources_dir) {
-                        Ok(canonical_paths) => {
-                            // Rebuild output records with canonical paths but
-                            // preserve the original kind/bytes from the processor.
-                            let records: Vec<ProcessOutput> = outputs
-                                .iter()
-                                .zip(canonical_paths.iter())
-                                .map(|(orig, canon)| ProcessOutput {
-                                    path:  canon.clone(),
-                                    kind:  orig.kind.clone(),
-                                    bytes: orig.bytes,
-                                })
-                                .collect();
-
-                            let outputs_count = records.len();
-
-                            match state.mark_done(job.id, records, metadata).await {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        job_id        = job.id,
-                                        outputs_count = outputs_count,
-                                        "job completed successfully",
-                                    );
-                                    metrics::counter!(METRIC_PROCESSED_TOTAL).increment(1);
-                                    true
-                                }
-                                Err(e) => {
-                                    // mark_done failed (e.g. DB error) — the
-                                    // row may still be in 'processing'; fall
-                                    // back to mark_failed so it can be retried.
-                                    tracing::error!(
-                                        job_id = job.id,
-                                        error  = %e,
-                                        "mark_done failed after successful processing \
-                                         — falling back to mark_failed (retryable)",
-                                    );
-                                    let _ = state
-                                        .mark_failed(job.id, e.to_string(), true)
-                                        .await;
-                                    metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
-                                    false
-                                }
-                            }
-                        }
-
-                        // Output path invariant violated — processor bug,
-                        // non-retryable.
-                        Err(validation_err) => {
+                        Err(e) => {
                             tracing::error!(
                                 job_id = job.id,
-                                error  = %validation_err,
-                                "processor output failed path invariant — \
-                                 marking failed (non-retryable)",
+                                error  = %e,
+                                "mark_done failed after successful processing \
+                                 — falling back to mark_failed (retryable)",
                             );
                             let _ = state
-                                .mark_failed(
-                                    job.id,
-                                    validation_err.to_string(),
-                                    false, // non-retryable
-                                )
+                                .mark_failed(job.id, e.to_string(), true)
                                 .await;
                             metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
                             false
                         }
                     }
                 }
-
-                // ── (e) ProcessResult::Error — use processor's retryable flag ─
-                ProcessResult::Error { error, retryable, .. } => {
-                    tracing::warn!(
-                        job_id    = job.id,
-                        error     = %error,
-                        retryable = retryable,
-                        "processor reported error result",
+                Err(validation_err) => {
+                    tracing::error!(
+                        job_id = job.id,
+                        error  = %validation_err,
+                        "pipeline output failed path invariant — \
+                         marking failed (non-retryable)",
                     );
-                    let _ = state.mark_failed(job.id, error, retryable).await;
+                    let _ = state
+                        .mark_failed(job.id, validation_err.to_string(), false)
+                        .await;
                     metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
                     false
                 }
             }
         }
 
-        // ── (f) Timeout — always retryable ───────────────────────────────
-        Err(ProcessorError::Timeout { elapsed_secs }) => {
+        // ── (e) ProcessResult::Error — use pipeline's retryable flag ────
+        ProcessResult::Error { error, retryable, metadata } => {
+            // The pipeline can request work_dir retention via metadata
+            // (e.g. empty-plan failures preserve .kb-plan.jsonl for
+            // postmortem inspection).
+            if let Some(meta) = metadata.as_ref() {
+                if let Some(flag) = meta.get("retain_work_dir").and_then(|v| v.as_bool()) {
+                    retain_work_dir_on_success = flag;
+                }
+            }
             tracing::warn!(
-                job_id       = job.id,
-                elapsed_secs = elapsed_secs,
-                "processor timed out — marking failed (retryable)",
+                job_id    = job.id,
+                error     = %error,
+                retryable = retryable,
+                "pipeline reported error result",
             );
-            let _ = state
-                .mark_failed(
-                    job.id,
-                    format!("processor timed out after {elapsed_secs}s"),
-                    true,
-                )
-                .await;
-            metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
-            false
-        }
-
-        // ── Cancelled by daemon shutdown ──────────────────────────────────
-        //
-        // The subprocess has already been signalled and reaped inside
-        // `invoke_processor`.  Leave the row in `processing` and return
-        // early; daemon shutdown calls `recover_in_flight_with_config`
-        // which resets it to `queued` for retry on next start, so no
-        // `attempts` increment is consumed for shutdown-induced
-        // cancellations.
-        Err(ProcessorError::Cancelled) => {
-            tracing::info!(
-                job_id = job.id,
-                "processor cancelled by daemon shutdown — row left in `processing` for recovery",
-            );
-            // Return early: skip the cleanup + final audit event paths so
-            // the post-mortem work_dir is retained for inspection.
-            return Ok(());
-        }
-
-        // ── (g) Other invocation errors — retryable by default ───────────
-        Err(e) => {
-            tracing::error!(
-                job_id = job.id,
-                error  = %e,
-                "processor invocation error — marking failed (retryable)",
-            );
-            let _ = state.mark_failed(job.id, e.to_string(), true).await;
+            let _ = state.mark_failed(job.id, error, retryable).await;
             metrics::counter!(METRIC_FAILED_TOTAL).increment(1);
             false
         }
@@ -453,19 +387,15 @@ pub struct WorkerPool {
     semaphore:   Arc<Semaphore>,
     state:       StateStore,
     config:      Arc<ProcessorConfig>,
-    /// Extra environment variables (loaded from the secrets file by the
-    /// daemon) that are forwarded into every processor subprocess via
-    /// `Command::envs`.  Holds credentials such as `KB_LLM_MODEL` and
-    /// `OPENROUTER_API_KEY` so they reach the processor regardless of
-    /// whether the daemon is run by `launchd` or via
-    /// `kb daemon --foreground`.
-    extra_env:   Arc<std::collections::BTreeMap<String, String>>,
+    /// Per-source-folder extraction-mode rules.  Resolved per file by
+    /// [`crate::pipeline::run_pipeline`].
+    extraction:  Arc<ExtractionConfig>,
     shutdown:    CancellationToken,
     notify:      Arc<Notify>,
     vault_root:  Arc<PathBuf>,
     sources_dir: Arc<PathBuf>,
-    /// Agent's mutation root.  Forwarded to the processor subprocess as
-    /// the ``KB_AGENT_ROOT`` env var; the kb-obsidian wrapper rejects any
+    /// Agent's mutation root.  Forwarded to the agent driver as the
+    /// `KB_AGENT_ROOT` env var; the kb-obsidian wrapper rejects any
     /// write whose target path resolves outside this tree.
     agent_root:  Arc<PathBuf>,
 }
@@ -475,22 +405,18 @@ impl WorkerPool {
     ///
     /// # Arguments
     ///
-    /// * `concurrency`  — Maximum number of simultaneous processor subprocesses.
+    /// * `concurrency`  — Maximum number of simultaneous in-process pipeline runs.
     /// * `state`        — Shared state store handle (cloned for each task).
-    /// * `config`       — Processor configuration shared across all workers.
-    /// * `extra_env`    — Key/value pairs to inject into every processor
-    ///                    subprocess (typically the contents of
-    ///                    `~/.config/knowledge-builder/secrets.env`).
+    /// * `config`       — Pipeline configuration shared across all workers.
+    /// * `extraction`   — Per-source-folder precision rules.
     /// * `shutdown`     — Token; when cancelled the claim loop exits cleanly.
     /// * `vault_root`   — Canonical absolute path to the vault root directory.
-    ///                    Should already have had `~` expanded and been
-    ///                    canonicalized by the config loader.
     /// * `sources_dir`  — Canonical absolute path to the sources directory.
     pub fn new(
         concurrency:  usize,
         state:        StateStore,
         config:       ProcessorConfig,
-        extra_env:    std::collections::BTreeMap<String, String>,
+        extraction:   ExtractionConfig,
         shutdown:     CancellationToken,
         vault_root:   PathBuf,
         sources_dir:  PathBuf,
@@ -500,7 +426,7 @@ impl WorkerPool {
             semaphore:   Arc::new(Semaphore::new(concurrency)),
             state,
             config:      Arc::new(config),
-            extra_env:   Arc::new(extra_env),
+            extraction:  Arc::new(extraction),
             shutdown,
             notify:      Arc::new(Notify::new()),
             vault_root:  Arc::new(vault_root),
@@ -627,9 +553,9 @@ impl WorkerPool {
                 // is in-flight (kills the child's process group, preventing
                 // orphan Python processes after `kb daemon` exits).
                 let shutdown    = self.shutdown.clone();
-                // Cheap Arc clone — extra_env is shared read-only across
-                // every job in the pool's lifetime.
-                let extra_env   = Arc::clone(&self.extra_env);
+                // Cheap Arc clone — extraction config is shared read-only
+                // across every job in the pool's lifetime.
+                let extraction  = Arc::clone(&self.extraction);
 
                 tracing::debug!(
                     job_id = job.id,
@@ -648,7 +574,7 @@ impl WorkerPool {
                         job,
                         state.clone(),
                         &config,
-                        &extra_env,
+                        &extraction,
                         &vault_root,
                         &sources_dir,
                         &agent_root,
@@ -694,21 +620,15 @@ impl WorkerPool {
 // ── Regression tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod secrets_leak_tests {
-    //! Defends against re-introducing the credential-leak bug where the
-    //! `#[instrument]` macro on `process_job` captured `extra_env` (which
-    //! holds OPENROUTER_API_KEY etc.) into every span field, writing
-    //! credentials to disk on every job.
+mod span_skip_tests {
+    //! Source-level invariant: `process_job`'s `#[instrument(skip(...))]`
+    //! must include the heavy/secret-bearing arguments and the
+    //! cancellation token so neither leaks into structured log fields.
 
-    /// Read this file and assert the `#[instrument]` block on `process_job`
-    /// continues to skip `extra_env` and `cancel_token`.  This is a
-    /// source-level invariant — the only foolproof way to enforce it is to
-    /// inspect the source.
     #[test]
-    fn instrument_skips_extra_env_and_cancel_token() {
+    fn instrument_skips_extraction_and_cancel_token() {
         let src = include_str!("pool.rs");
 
-        // Find the `#[instrument(` block immediately preceding `pub async fn process_job`.
         let fn_idx = src
             .find("pub async fn process_job(")
             .expect("process_job must exist");
@@ -717,17 +637,15 @@ mod secrets_leak_tests {
             .expect("#[instrument(...)] must precede process_job");
         let inst = &head[inst_idx..];
 
-        // Pull out the `skip(...)` clause.
         let skip_start = inst.find("skip(").expect("instrument must have skip(...)");
         let skip_end   = inst[skip_start..].find(')').expect("skip(...) must close");
         let skip       = &inst[skip_start..skip_start + skip_end];
 
-        for needle in ["extra_env", "cancel_token"] {
+        for needle in ["extraction", "cancel_token"] {
             assert!(
                 skip.contains(needle),
                 "process_job's #[instrument(skip(...))] must include `{needle}` to \
-                 prevent credentials / sensitive state from being written to log \
-                 files.  Current skip clause: {skip}"
+                 prevent log-field bloat in worker spans, but found: {skip:?}",
             );
         }
     }

@@ -8,7 +8,7 @@ description = "Agent driver, plan parser, and link sweeper for Knowledge Builder
 [dependencies]
 kb-core      = { path = "../kb-core" }
 
-# Async runtime
+# Async runtime + process spawning + bufreader for JSON-line streaming
 tokio        = { workspace = true }
 
 # Serialization (plan JSONL is bit-identical to the Python wrapper's output)
@@ -27,6 +27,10 @@ regex        = "1"
 
 # Walking the vault to build the existing-note index
 walkdir      = "2"
+
+# Unix process group setsid + kill (driver only)
+[target.'cfg(unix)'.dependencies]
+libc         = { workspace = true }
 
 [dev-dependencies]
 tempfile     = { workspace = true }

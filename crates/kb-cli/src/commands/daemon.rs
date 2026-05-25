@@ -240,13 +240,23 @@ pub async fn run(args: DaemonArgs) -> Result<()> {
     // ── 9. Start the worker pool ──────────────────────────────────────────────
     //
     // Workers atomically claim `queued` rows and process them via the
-    // configured processor subprocess.  The pool is bounded by
+    // in-process pipeline (kb-extractor + kb-agent).  Bounded by
     // `config.worker.concurrency` permits.
+    //
+    // Secrets loaded above are applied to *this process's* OS env so the
+    // in-process agent driver picks them up via `std::env::var()` (the
+    // pipeline runs in the daemon's own address space — there is no
+    // child subprocess we'd hand a separate env to).
+    for (k, v) in &secrets.entries {
+        // SAFETY: pool startup is single-threaded; nothing else reads
+        // os::env at this point in the lifecycle.
+        unsafe { std::env::set_var(k, v); }
+    }
     let pool = WorkerPool::new(
         config.worker.concurrency,
         state.clone(),
         config.processor.clone(),
-        secrets.entries,
+        config.extraction.clone(),
         shutdown.clone(),
         PathBuf::from(&config.paths.vault_root),
         PathBuf::from(&config.paths.sources_dir),

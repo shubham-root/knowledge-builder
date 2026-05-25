@@ -24,20 +24,21 @@ by `litellm`.
 ## 1.  Build and install the binaries (~5 min)
 
 ```bash
-# Rust daemon (~60-90 s on a cold cache)
+# Rust daemon + wrapper (~60-90 s on a cold cache; pulls in transmutation
+# as a Cargo dependency so all extraction is native Rust — no Python).
 cargo build --release
-sudo cp target/release/kb /usr/local/bin/kb
+sudo cp target/release/kb           /usr/local/bin/kb
+sudo cp target/release/kb-obsidian  /usr/local/bin/kb-obsidian
 kb --version
+kb-obsidian --help    # bare invocation prints a usage error — that's expected
 
 # pi-coding-agent (the LLM agent loop)
 npm install -g @earendil-works/pi-coding-agent
 pi --version
 
-# Python processor venv (~3 min, downloads docling + torch)
-python3 -m venv ~/.local/share/kb/venv
-~/.local/share/kb/venv/bin/pip install --upgrade pip
-~/.local/share/kb/venv/bin/pip install -e "$(pwd)/processors/default[llm]"
-ls -l ~/.local/share/kb/venv/bin/kb-processor    # should exist
+# Native tooling transmutation depends on (PDF page rendering, image OCR).
+# poppler is required for PDFs; tesseract for image OCR.
+brew install poppler tesseract
 ```
 
 ## 2.  Prepare your vault (1 min)
@@ -76,8 +77,18 @@ vault_root  = "~/Documents/Obsidian"
 sources_dir = "~/Documents/Obsidian/Sources"
 agent_root  = "~/Documents/Obsidian/KnowledgeBase"
 
-[processor]
-command = "~/.local/share/kb/venv/bin/kb-processor"
+# Optional: per-source-folder precision rules for the extractor.
+# default_mode is `fast` (~50 pages/sec, ~80% similarity).  Add
+# rules to opt specific subtrees into `precision` (~95% similarity,
+# similar speed) or `ffi` (the docling-parse C++ FFI; requires
+# `cargo build --release --features docling-ffi`).
+#
+# [extraction]
+# default_mode = "fast"
+#
+# [[extraction.rules]]
+# path = "ArchivePapers"
+# mode = "precision"
 EOF
 ```
 
@@ -112,8 +123,9 @@ exactly what to fix.  Common ones:
 
 * `agent_root '…' overlaps sources_dir`     → you nested them; move one.
 * `Secrets file '…' has permissive mode 644` → `chmod 600 …`.
-* `processor.command '…': file not found`    → the venv install didn’t
-  finish; rerun the `pip install -e` step.
+* `kb-obsidian binary missing on PATH`        → you forgot to copy the
+  second binary; rerun the `sudo cp target/release/kb-obsidian …`
+  step from section 1.
 
 ## 5.  Start the daemon
 

@@ -276,7 +276,6 @@ impl TestVault {
                 backoff_secs,
             },
             processor: ProcessorConfig {
-                command:       processor_cmd.to_string(),
                 timeout_secs,
                 work_dir_root: self.work_dir_root.to_string_lossy().to_string(),
             },
@@ -327,7 +326,7 @@ impl TestVault {
             config.worker.concurrency,
             self.store.clone(),
             config.processor.clone(),
-            std::collections::BTreeMap::new(),
+            config.extraction.clone(),
             shutdown,
             PathBuf::from(&config.paths.vault_root),
             PathBuf::from(&config.paths.sources_dir),

@@ -99,14 +99,6 @@ pub enum ConfigError {
     )]
     AgentRootOverlapsSources { agent_root: String, sources_dir: String },
 
-    /// processor.command could not be found or is not executable.
-    #[error(
-        "processor.command '{command}': {detail}\n\
-         Action: verify the script path is correct, that the file exists, \
-         and that it has execute permission (`chmod +x`)."
-    )]
-    ProcessorCommand { command: String, detail: String },
-
     /// db_path parent directory cannot be created or SQLite open failed.
     #[error(
         "db_path '{db_path}': {detail}\n\
@@ -224,12 +216,17 @@ pub struct WorkerConfig {
     pub backoff_secs: Vec<u64>,
 }
 
-/// Subprocess processor parameters.
+/// In-process pipeline parameters.
+///
+/// Historically this used to spawn a Python subprocess (`kb-processor`)
+/// and `command` pointed at the venv binary.  The pipeline is now Rust
+/// in-process so neither `command` nor a heavy timeout policy is
+/// needed; we keep just two fields:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessorConfig {
-    /// Path (absolute, relative, or bare name on `$PATH`) to the processor.
-    pub command: String,
-    /// Hard wall-clock timeout per invocation (seconds).
+    /// Hard wall-clock timeout per job (seconds).  Forwarded to the
+    /// agent driver as the LLM budget.  Override per-process via the
+    /// `KB_AGENT_TIMEOUT_SECS` environment variable.
     pub timeout_secs: u64,
     /// Root directory under which per-job working directories are created.
     pub work_dir_root: String,
@@ -395,7 +392,6 @@ impl Default for Config {
                 backoff_secs: vec![30, 300, 1_800],
             },
             processor: ProcessorConfig {
-                command:       "~/.local/share/kb/venv/bin/kb-processor".into(),
                 timeout_secs:  3_600,
                 work_dir_root: "~/Library/Caches/knowledge-builder/jobs".into(),
             },
@@ -437,7 +433,6 @@ fn expand_all_paths(mut cfg: Config) -> Config {
     cfg.paths.sources_dir       = expand_tilde(&cfg.paths.sources_dir);
     cfg.paths.db_path           = expand_tilde(&cfg.paths.db_path);
     cfg.paths.log_dir           = expand_tilde(&cfg.paths.log_dir);
-    cfg.processor.command       = expand_tilde(&cfg.processor.command);
     cfg.processor.work_dir_root = expand_tilde(&cfg.processor.work_dir_root);
 
     // Resolve the `<vault_root>` sentinel BEFORE tilde expansion in case
@@ -532,8 +527,7 @@ impl Config {
             }
         }
 
-        // ── 5. processor.command: exists and is executable ───────────────────
-        check_processor_command(&self.processor.command, &mut errors);
+        // ── 5. processor.command removed: in-process pipeline now ─────────────
 
         // ── 6. db_path: parent creatable; SQLite opens ───────────────────────
         check_db_path(&self.paths.db_path, &mut errors);
@@ -778,69 +772,8 @@ fn check_agent_root(path: &str, errors: &mut Vec<ConfigError>) -> Option<PathBuf
     }
 }
 
-/// Check 5: processor.command exists and is executable.
-///
-/// Handles three command styles:
-/// - Absolute path (`/usr/local/bin/python3`)
-/// - Relative path with a `/` component (`processors/default/run.sh`)
-/// - Bare name looked up on `$PATH` (`python3`)
-fn check_processor_command(command: &str, errors: &mut Vec<ConfigError>) {
-    let resolved = if command.contains('/') {
-        // Explicit path
-        let p = PathBuf::from(command);
-        if p.exists() { Some(p) } else { None }
-    } else {
-        // Bare name — search $PATH
-        find_in_path(command)
-    };
-
-    let resolved = match resolved {
-        Some(p) => p,
-        None => {
-            errors.push(ConfigError::ProcessorCommand {
-                command: command.to_owned(),
-                detail:  if command.contains('/') {
-                    format!("file not found at '{command}'")
-                } else {
-                    format!("'{command}' not found in $PATH or filesystem")
-                },
-            });
-            return;
-        }
-    };
-
-    // Must be a regular file (not a directory) and have at least one execute bit set
-    match fs::metadata(&resolved) {
-        Err(e) => {
-            errors.push(ConfigError::ProcessorCommand {
-                command: command.to_owned(),
-                detail:  format!("cannot stat '{}': {e}", resolved.display()),
-            });
-        }
-        Ok(m) if m.is_dir() => {
-            errors.push(ConfigError::ProcessorCommand {
-                command: command.to_owned(),
-                detail:  format!("'{}' is a directory, not an executable file", resolved.display()),
-            });
-        }
-        Ok(m) => {
-            let mode = m.permissions().mode();
-            if mode & 0o111 == 0 {
-                errors.push(ConfigError::ProcessorCommand {
-                    command: command.to_owned(),
-                    detail: format!(
-                        "'{}' exists but has no execute permission (mode {mode:o}); \
-                         run: chmod +x '{}'",
-                        resolved.display(),
-                        resolved.display(),
-                    ),
-                });
-            }
-        }
-    }
-}
-
 /// Search each directory in `$PATH` for a file named `name`.
+#[allow(dead_code)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -976,7 +909,6 @@ mod tests {
                 backoff_secs: vec![30, 300],     // len == max_attempts - 1 == 2 ✓
             },
             processor: ProcessorConfig {
-                command:       cmd.to_str().unwrap().to_owned(),
                 timeout_secs:  1_800,
                 work_dir_root: tmp.path().join("jobs").to_str().unwrap().to_owned(),
             },
@@ -1091,17 +1023,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check5_processor_command_missing() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = valid_config(&tmp);
-        cfg.processor.command = "/nonexistent/run.sh".into();
-        let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| matches!(e, ConfigError::ProcessorCommand { .. })),
-            "expected ProcessorCommand error, got: {errs:?}"
-        );
-    }
+    // (test `check5_processor_command_missing` removed: in-process pipeline
+    //  no longer requires a processor.command path, so the corresponding
+    //  validation check was deleted in Session B.)
 
     // ── agent_root checks (4b) ─────────────────────────────────────────────────
 
@@ -1186,25 +1110,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check5_processor_command_not_executable() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = valid_config(&tmp);
-        // Create a non-executable file
-        let non_exec = tmp.path().join("notexec.sh");
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .mode(0o644)          // no execute bit
-            .open(&non_exec)
-            .unwrap();
-        cfg.processor.command = non_exec.to_str().unwrap().to_owned();
-        let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.iter().any(|e| matches!(e, ConfigError::ProcessorCommand { .. })),
-            "expected ProcessorCommand error, got: {errs:?}"
-        );
-    }
+    // (test `check5_processor_command_not_executable` removed: in-process
+    //  pipeline no longer requires a processor.command path.)
 
     #[test]
     fn check8_backoff_too_short() {
@@ -1243,7 +1150,6 @@ mod tests {
         // Break two checks simultaneously
         cfg.paths.vault_root      = "/no/vault".into();
         cfg.paths.sources_dir     = "/no/sources".into();
-        cfg.processor.command     = "/no/cmd".into();
         cfg.worker.max_attempts   = 4;
         cfg.worker.backoff_secs   = vec![];
         let errs = cfg.validate().unwrap_err();

@@ -74,26 +74,20 @@ promote to apply mode once you trust the agent’s decisions.
                    │ FSEvents + periodic full scan
                    ▼
   ┌──────────────────────────────────────────────────────────────────┐
-  │  Daemon (Rust, launchd-managed)                                  │
-  │    kb-watcher  stability + SHA-256 hash + dedup                  │
-  │    kb-core     state.db (SQLite) + state machine                 │
-  │    kb-worker   bounded pool, atomic claim, retry / backoff       │
-  │    kb-ops      HTTP / SSE on 127.0.0.1                           │
-  └────────────────┬─────────────────────────────────────────────────┘
-                   │ spawns one Python subprocess per job
-                   ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  kb-processor (Python, dedicated venv)                           │
-  │    EXTRACT     docling + MPS, 5-page batches, native/OCR mix     │
-  │    STAGE       extracted.md  ▶  work_dir/                        │
-  │    INTEGRATE   spawn pi --mode rpc, drive integration agent      │
+  │  Daemon (Rust, launchd-managed) — single binary, no Python       │
+  │    kb-watcher    stability + SHA-256 hash + dedup                │
+  │    kb-core       state.db (SQLite) + state machine               │
+  │    kb-worker     bounded pool, atomic claim, retry / backoff     │
+  │    kb-extractor  EXTRACT via transmutation (Cargo lib, pure Rust)│
+  │    kb-agent      INTEGRATE: drive `pi --mode rpc`, plan, sweep   │
+  │    kb-ops        HTTP / SSE on 127.0.0.1                         │
   └────────────────┬─────────────────────────────────────────────────┘
                    │ spawns pi binary (RPC mode, restricted PATH)
                    ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │  pi --mode rpc  (LLM agent loop)                                 │
   │    one tool: bash                                                │
-  │    skill: knowledge-builder-integrator (loaded from package)     │
+  │    skill: knowledge-builder-integrator (embedded in kb-agent)    │
   │    PATH = curated wrapper dir only                               │
   │    issues kb-obsidian commands (the only mutation primitive)     │
   └────────────────┬─────────────────────────────────────────────────┘
@@ -102,21 +96,24 @@ promote to apply mode once you trust the agent’s decisions.
               [back to vault]
 ```
 
-Three distinct programs cooperate:
+Two cooperating processes (no Python):
 
-* **The Rust daemon** (`kb`) is the long-running supervisor.  It watches
-  the filesystem, manages the queue, applies retry / backoff, runs the
-  HTTP ops endpoints, and spawns processor subprocesses.  All persistent
-  state lives in a single SQLite database (`state.db`).
-* **The Python processor** (`kb-processor`) is a per-job subprocess
-  that performs extraction (via `docling`) and orchestrates the agent
-  run.  It returns a JSON `ProcessResult` to the daemon.
-* **`pi --mode rpc`** is the LLM agent loop.  The processor spawns it,
-  registers its skills, and feeds it the integration prompt.  The
-  agent’s only tool is `bash`, but its `PATH` is restricted to a
-  curated wrapper directory so the only mutation primitive available
-  is `kb-obsidian` (a Python policy wrapper around Obsidian’s native
-  CLI).
+* **The Rust daemon** (`kb`) is the long-running supervisor.  It
+  watches the filesystem, manages the queue, runs the in-process
+  pipeline (extract → integrate → sweep), applies retry / backoff,
+  serves the HTTP ops endpoints, and spawns `pi` for each job.  All
+  persistent state lives in a single SQLite database (`state.db`).
+  Document conversion is provided by the
+  [`transmutation`](https://crates.io/crates/transmutation) crate as
+  a Cargo library dependency — not a subprocess.
+* **`pi --mode rpc`** is the LLM agent loop.  The daemon spawns it,
+  registers its skill (`knowledge-builder-integrator`, embedded in
+  the kb binary at compile time), and feeds it the integration
+  prompt.  The agent's only tool is `bash`, but its `PATH` is
+  restricted to a curated wrapper directory so the only mutation
+  primitive available is `kb-obsidian` (a separate Rust binary in
+  this workspace that wraps Obsidian's native CLI with policy
+  invariants).
 
 A detailed walk-through of each stage is in [Pipeline
 internals](#pipeline-internals).
@@ -127,26 +124,32 @@ internals](#pipeline-internals).
 
 | Requirement | Why | How to verify |
 |---|---|---|
-| **macOS 12+** | FSEvents, launchd, Apple-Silicon MPS for docling. | `sw_vers -productVersion` |
-| **Rust 1.75+** (only when building from source) | Compiles `kb`. | `rustc --version` |
-| **Python 3.12+** | Hosts the docling pipeline and the agent driver. | `python3 --version` |
+| **macOS 12+** | FSEvents, launchd. | `sw_vers -productVersion` |
+| **Rust 1.75+** (only when building from source) | Compiles `kb` and `kb-obsidian`. | `rustc --version` |
 | **Obsidian 1.7+** with **Command line interface enabled** | The agent talks to your vault through the `obsidian` CLI. | Obsidian → Settings → General → *Command line interface*; then `which obsidian` |
 | **`pi-coding-agent`** | The LLM agent loop. | `which pi && pi --version` |
+| **`poppler` + `tesseract`** (Homebrew) | Optional native helpers transmutation uses for PDF page rendering and image OCR. | `brew install poppler tesseract` |
 | An **OpenRouter API key** (or any provider supported by `litellm`) | LLM calls during synthesis and integration. | https://openrouter.ai/keys |
-| Local disk space for an ML venv (~2 GB) | docling pulls in `torch`, `transformers`, etc. | n/a |
 
 The daemon is single-user and macOS-only.  Linux/Windows ports are
 structurally feasible but currently out of scope.
 
-### Build and install the daemon binary
+### Build and install the daemon + wrapper binaries
 
 From a clean clone of this repository:
 
 ```bash
-cargo build --release          # ~60-90 s on a cold cache (rusqlite is bundled)
-cp target/release/kb /usr/local/bin/kb
+cargo build --release          # pulls in transmutation as a Cargo lib dep;
+                               # ~3 min cold-cache, ~5 s incremental.
+sudo cp target/release/kb           /usr/local/bin/kb
+sudo cp target/release/kb-obsidian  /usr/local/bin/kb-obsidian
 kb --version
+kb-obsidian --help    # bare invocation prints a usage error — expected
 ```
+
+The two binaries together replace the legacy Python processor /
+wrapper pair.  No virtualenv, no `pip install`, no `pyproject.toml`
+in the runtime install set.
 
 ### Install pi-coding-agent
 
@@ -167,7 +170,7 @@ Open Obsidian and turn on:
 Settings → General → Command line interface
 ```
 
-Follow Obsidian’s prompt to register the binary.  After that:
+Follow Obsidian's prompt to register the binary.  After that:
 
 ```bash
 which obsidian              # /usr/local/bin/obsidian
@@ -178,38 +181,39 @@ obsidian files total        # should print a number
 The agent will only ever talk to the running Obsidian app via this
 CLI — it never edits markdown files directly.
 
-### Set up the Python processor venv
+### Native helpers `transmutation` uses (PDF rendering + OCR)
 
-The processor lives in `processors/default/` and is installed into a
-dedicated virtualenv to keep its heavy ML dependencies (torch, docling,
-transformers) isolated from the system Python.
+For PDF page-rendering and image OCR, transmutation shells out to
+[poppler](https://poppler.freedesktop.org/) and
+[Tesseract](https://github.com/tesseract-ocr/tesseract).  Markdown
+extraction itself is pure Rust and does not need either:
 
 ```bash
-python3 -m venv ~/.local/share/kb/venv
-~/.local/share/kb/venv/bin/pip install --upgrade pip
-~/.local/share/kb/venv/bin/pip install -e "$(pwd)/processors/default[llm]"
-
-# Verify the entry-point script was created.
-ls -l ~/.local/share/kb/venv/bin/kb-processor
+brew install poppler tesseract
 ```
 
-The `[llm]` extra installs `litellm`, which routes every supported
-provider (OpenRouter, OpenAI, Anthropic, Bedrock, local Ollama, …)
-through one interface.
+If you only ingest text-PDFs and never images, both are optional.
+The daemon falls back gracefully if either is missing, but the
+feature flag will note them as absent in `kb doctor` output.
 
-#### Why a pinned `transformers`
+### Optional: build with `docling-ffi` for maximum extraction fidelity
 
-`pyproject.toml` pins `transformers>=5.8.1,<5.9.0`.  Newer transformers
-crashes on Apple-Silicon MPS for every PDF page processed by docling
-(`TypeError: Cannot convert a MPS Tensor to float64 dtype`).  The pin
-can be removed once docling ships against a fixed transformers —
-tracked at https://github.com/docling-project/docling/issues/3483.
+The default build ships two extraction modes:
 
-#### Why a `setdefault PYTORCH_ENABLE_MPS_FALLBACK=1`
+* **Fast** (~80% similarity to ground truth, ~50 pages/sec).
+* **Precision** (~95% similarity, similar throughput).  Pure Rust.
 
-The processor sets this env var at import time so any straggler MPS×
-float64 ops fall back to CPU instead of crashing.  This is a belt to
-the transformers pin’s suspenders.
+A third **`ffi`** mode wraps the docling-parse C++ engine via ONNX
+Runtime and pdfium-render for layout-perfect academic PDFs.  This
+mode is opt-in because it adds ~60 MB to the binary and a slower
+first-run model load.  The transmutation crate's `build.rs` will
+direct you to a one-time C++ pre-build step the first time you try:
+
+```bash
+cargo build --release --features docling-ffi
+# follow the build.rs hint pointing at
+# https://github.com/hivellm/transmutation/blob/main/docs/FFI.md
+```
 
 ## Configuration
 
@@ -278,7 +282,7 @@ hash_chunk_bytes   = 1048576
 
 [worker]
 # Maximum simultaneous processor subprocesses.  Each one runs docling
-# with MPS, so 1–2 is appropriate for an M-series laptop.
+# Pure Rust extraction; concurrency = 2 is fine on any modern laptop.
 concurrency  = 2
 
 # Total attempts per source.  Counted across daemon restarts.
@@ -288,18 +292,29 @@ max_attempts = 3
 backoff_secs = [30, 300, 1800]    # 30 s, 5 min, 30 min
 
 [processor]
-# How the daemon spawns the processor.  Default points at the venv we
-# set up above.  Can be a bare name on $PATH, an absolute path, or a
-# space-separated argv.
-command       = "~/.local/share/kb/venv/bin/kb-processor"
-
-# Hard wall-clock timeout per invocation.  On expiry the daemon sends
-# SIGTERM to the child's process group, waits 5 s, then SIGKILL.
+# Hard wall-clock timeout per job.  Forwarded to the agent driver as
+# the LLM budget.  Override at runtime via `KB_AGENT_TIMEOUT_SECS`.
 timeout_secs  = 1800
 
 # Per-job working directories live under here.  Cleaned automatically
 # on success; retained on failure for inspection.
 work_dir_root = "~/Library/Caches/knowledge-builder/jobs"
+
+[extraction]
+# Default precision tier for files in `sources_dir` not matched by a
+# rule below.  Choices: "fast" (~50 pages/sec, ~80% similarity),
+# "precision" (~95% similarity, similar speed), "ffi" (docling-parse
+# C++ via ONNX Runtime; only when built with `--features docling-ffi`).
+default_mode = "fast"
+
+# First-match-wins rules.  Path is relative to sources_dir.
+# [[extraction.rules]]
+# path = "ArchivePapers"
+# mode = "precision"
+#
+# [[extraction.rules]]
+# path = "Legal"
+# mode = "ffi"
 
 [ops]
 # HTTP endpoint for `kb status`, `kb tail`, etc.  Loopback only.

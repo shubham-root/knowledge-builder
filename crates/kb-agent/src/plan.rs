@@ -97,7 +97,7 @@ impl PlanEntry {
 }
 
 /// The complete set of mutations from one agent run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     /// File the entries were read from (or will be written to).  Used
     /// for diagnostics; not part of the wire format.

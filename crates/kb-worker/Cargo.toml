@@ -5,7 +5,9 @@ edition     = "2021"
 description = "Job execution: worker pool, subprocess invocation, JSON result parsing, output validation"
 
 [dependencies]
-kb-core = { workspace = true }
+kb-core      = { workspace = true }
+kb-extractor = { path = "../kb-extractor" }
+kb-agent     = { path = "../kb-agent" }
 
 # Async runtime
 tokio = { workspace = true }

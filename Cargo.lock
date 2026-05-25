@@ -2191,6 +2191,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kb-core",
+ "libc",
  "regex",
  "serde",
  "serde_json",
@@ -2331,7 +2332,9 @@ name = "kb-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "kb-agent",
  "kb-core",
+ "kb-extractor",
  "libc",
  "metrics",
  "serde",
