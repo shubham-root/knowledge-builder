@@ -28,6 +28,7 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod commands;
+mod pi_resolver;
 
 #[derive(Parser)]
 #[command(

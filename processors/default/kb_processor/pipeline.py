@@ -773,6 +773,14 @@ async def process(
     if len(agent_result.plan) == 0 and not agent_result.aborted:
         final_text = (agent_result.final_assistant_text or "").strip()
         excerpt = (final_text[:400] + ("…" if len(final_text) > 400 else "")) if final_text else "(no final assistant message)"
+        # If pi crashed/exited early it usually leaves a clue on stderr.
+        # Surface it in both the error string and the metadata so the
+        # daemon log + ``kb show <id>`` reveal the actual cause.
+        pi_stderr = (getattr(agent_result, "pi_stderr", "") or "").strip()
+        stderr_excerpt = (
+            (" pi stderr: " + (pi_stderr[:400] + ("…" if len(pi_stderr) > 400 else "")))
+            if pi_stderr else ""
+        )
         logger.warning(
             "Agent produced an empty plan after %d turn(s); marking as "
             "retryable failure so the work_dir is preserved.",
@@ -782,6 +790,7 @@ async def process(
             error=(
                 f"Agent ran for {agent_result.turns} turn(s) in {agent_mode} "
                 f"mode but proposed no mutations.  Final message: {excerpt}"
+                f"{stderr_excerpt}"
             ),
             retryable=True,
             metadata={
@@ -795,6 +804,7 @@ async def process(
                 "extracted_md":       str(extracted_md_path),
                 "agent_provider":     agent_result.metadata.get("provider"),
                 "agent_model":        agent_result.metadata.get("model"),
+                "pi_stderr":          pi_stderr[:4000] if pi_stderr else "",
             },
         )
 

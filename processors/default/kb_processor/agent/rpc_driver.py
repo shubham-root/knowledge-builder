@@ -48,6 +48,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,11 @@ class AgentResult:
     #: wrapper (e.g. via raw ``cat >`` or ``cp``).  Populated by the
     #: post-run :func:`_audit_vault_diff` check.
     rogue_writes:        list[Path] = field(default_factory=list)
+    #: Bytes pi wrote to stderr during the run.  Empty in the happy path;
+    #: non-empty when pi crashed or emitted warnings (e.g. unrecognised
+    #: model id, malformed skill, transient HTTP error).  Surfaced in
+    #: failure metadata so operators can diagnose 0-turn deaths.
+    pi_stderr:           str = ""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -679,6 +685,38 @@ def run_agent(inp: AgentInput) -> AgentResult:
     except FileNotFoundError as exc:
         raise PiSpawnError(f"could not exec pi: {exc}") from exc
 
+    # ── Drain pi's stderr on a background thread ────────────────────────
+    # Pi may write fatal startup errors (auth failures, model-routing
+    # rejections, missing skills directory, etc.) to stderr and then
+    # exit silently.  If we leave the pipe unread, those messages are
+    # lost forever — the result is a failure with ``agent_elapsed_secs``
+    # near zero and no diagnostic context.  A small, bounded buffer is
+    # enough; we surface its contents in error paths and the audit log.
+    pi_stderr_chunks: list[str] = []
+    _STDERR_LIMIT = 64 * 1024  # 64 KiB cap; pi never logs more than ~few KB
+
+    def _drain_stderr(stream: Any) -> None:
+        try:
+            for chunk in iter(lambda: stream.read(4096), ""):
+                if not chunk:
+                    break
+                pi_stderr_chunks.append(chunk)
+                # Bound memory; keep only the tail.
+                joined_len = sum(len(c) for c in pi_stderr_chunks)
+                while joined_len > _STDERR_LIMIT and len(pi_stderr_chunks) > 1:
+                    joined_len -= len(pi_stderr_chunks.pop(0))
+        except Exception:
+            # Never let the drain thread crash the agent loop.
+            pass
+
+    stderr_thread = threading.Thread(
+        target = _drain_stderr,
+        args   = (proc.stderr,),
+        daemon = True,
+        name   = "pi-stderr-drain",
+    )
+    stderr_thread.start()
+
     final_assistant_text: list[str] = []
     turns = 0
     aborted = False
@@ -795,6 +833,17 @@ def run_agent(inp: AgentInput) -> AgentResult:
         logger.info("vault audit: clean (no rogue writes)")
 
     elapsed = time.perf_counter() - started
+    # Wait briefly for the stderr drainer to flush any tail bytes pi
+    # emitted between its last stdout event and process exit.
+    stderr_thread.join(timeout=1.0)
+    pi_stderr = "".join(pi_stderr_chunks).strip()
+    if pi_stderr:
+        logger.warning(
+            "pi wrote %d byte(s) to stderr during run; first 500 chars: %s",
+            len(pi_stderr),
+            pi_stderr[:500].replace("\n", " | "),
+        )
+
     logger.info(
         "agent done: turns=%d elapsed=%.1fs plan=%s aborted=%s",
         turns, elapsed, plan.summary(), aborted,
@@ -815,6 +864,7 @@ def run_agent(inp: AgentInput) -> AgentResult:
         turns                = turns,
         aborted              = aborted,
         rogue_writes         = rogue_writes,
+        pi_stderr            = pi_stderr,
         metadata={
             "provider":     provider,
             "model":        model_id,

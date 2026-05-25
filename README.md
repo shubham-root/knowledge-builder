@@ -1294,6 +1294,89 @@ daemon does.  Restarting with `kb install` (or just
 `launchctl kickstart -k gui/$UID/com.user.knowledge-builder`) makes
 the daemon re-read.
 
+### “pi binary not found” / “Agent ran for 0 turns” under launchd (fnm / nvm / volta)
+
+#### Symptom A: explicit “not found”
+
+`kb daemon --foreground` works fine but the launchd-managed service fails
+with
+
+> `pi binary not found: pi binary 'pi' not found on PATH.`
+
+#### Symptom B: silent 0-turn death
+
+The job fails with
+
+> `Agent ran for 0 turn(s) in apply mode but proposed no mutations.`
+> `Final message: (no final assistant message)`
+> `pi stderr: env: node: No such file or directory`
+
+or with `agent_elapsed_secs` near zero in the job's `processor_meta`.
+
+#### Cause
+
+Node version managers like **fnm** and **nvm** install `pi` *and* `node`
+at per-shell-session paths that are only on `$PATH` because your shell’s
+init script (`.zshrc`, `.bash_profile`) put them there.  launchd does NOT
+execute shell init, so it sees only the static `PATH` baked into the
+LaunchAgent plist.  Two consequences:
+
+1. The daemon can’t find `pi` itself → _Symptom A_.
+2. Even when `pi`’s absolute path is known, `pi` is a Node script with
+   shebang `#!/usr/bin/env node`.  If the plist’s `PATH` doesn’t
+   include `node`, `env` fails to resolve it and pi exits in
+   <1 s before producing a single RPC event → _Symptom B_.
+
+#### Automatic fix
+
+`kb doctor` detects shim paths and warns.  `kb install` then:
+
+* bakes the **stable absolute path** of `pi` into the plist as
+  `EnvironmentVariables.KB_PI_BIN`, and
+* **prepends the directory containing `node`** to the plist’s
+  `EnvironmentVariables.PATH` (so `node`, `npm`, and `npx` are
+  reachable when pi launches).
+
+After `kb install`, the daemon spawns pi reliably regardless of how
+your shell decorates `$PATH`.
+
+#### Manual override
+
+If you ever need to override manually — for example, you upgraded Node
+and the version directory changed without re-running `kb install` —
+you have two options.
+
+*Edit the plist directly* (re-run `kb install` to regenerate it from
+your current shell PATH at any time):
+
+```xml
+<key>PATH</key>
+<string>/Users/you/.local/share/fnm/node-versions/v24.13.1/installation/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+<key>KB_PI_BIN</key>
+<string>/Users/you/.local/share/fnm/node-versions/v24.13.1/installation/bin/pi</string>
+```
+
+Then `launchctl kickstart -k gui/$UID/com.user.knowledge-builder`.
+
+*Or* set `KB_PI_BIN` in `secrets.env` (loaded by the daemon at
+startup).  This is enough on its own only if the plist’s `PATH`
+already contains a directory with `node`:
+
+```dotenv
+KB_PI_BIN=/Users/you/.local/share/fnm/node-versions/<version>/installation/bin/pi
+```
+
+The stable paths are whatever `which`’s symlinks ultimately point at:
+
+```bash
+readlink -f "$(which pi)"
+readlink -f "$(which node)"
+# fnm   example pi   : /Users/you/.local/share/fnm/node-versions/v24.13.1/installation/bin/pi
+# fnm   example node : /Users/you/.local/share/fnm/node-versions/v24.13.1/installation/bin/node
+# nvm   example pi   : /Users/you/.nvm/versions/node/v20.0.0/bin/pi
+# volta example pi   : /Users/you/.volta/bin/pi (already stable; no override needed)
+```
+
 ## Development
 
 ### Repository layout

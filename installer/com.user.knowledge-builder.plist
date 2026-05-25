@@ -55,8 +55,8 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
-    </dict>
+        <string>{{PLIST_PATH}}</string>
+{{EXTRA_ENV_ENTRIES}}    </dict>
 
     <!-- Background process type: eligible for reduced scheduling priority -->
     <key>ProcessType</key>

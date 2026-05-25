@@ -17,6 +17,7 @@
 //! Pass `--force` to overwrite an existing plist and re-register the service.
 
 use anyhow::{bail, Context, Result};
+use std::path::Path;
 
 // ── Compile-time embedded plist template ──────────────────────────────────────
 
@@ -74,6 +75,88 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     // ── Step 4: current user ID ───────────────────────────────────────────────
     let uid = current_uid();
 
+    // Resolve the absolute path of the `pi` binary on the operator's
+    // shell PATH and bake it into the plist's EnvironmentVariables.
+    //
+    // launchd does NOT execute shell init scripts before launching the
+    // daemon — it sees only the static `EnvironmentVariables.PATH`
+    // baked into the plist below.  Version-manager shims like fnm's
+    // per-session bin (~/.local/state/fnm_multishells/<pid>_<ts>) and
+    // nvm's are invisible to the daemon.  Injecting `KB_PI_BIN`
+    // sidesteps the whole PATH question.
+    let pi_location = crate::pi_resolver::locate_pi();
+    let extra_env_entries = match &pi_location {
+        crate::pi_resolver::PiLocation::NotFound => {
+            println!(
+                "  ⚠️  `pi` not found on the operator's PATH.  The daemon will\n\
+                 \t   fail at the first job until pi-coding-agent is installed\n\
+                 \t   (npm install -g @earendil-works/pi-coding-agent)."
+            );
+            String::new()
+        }
+        crate::pi_resolver::PiLocation::Stable(p) => {
+            println!("  ✓  pi resolved        → {} (stable)", p.display());
+            format!(
+                "        <key>KB_PI_BIN</key>\n        <string>{}</string>\n",
+                p.display(),
+            )
+        }
+        crate::pi_resolver::PiLocation::PerShellShim { shim, stable, manager } => {
+            println!(
+                "  ✓  pi resolved        → {} ({} per-shell shim)",
+                shim.display(), manager,
+            );
+            println!(
+                "     baking stable path → {} into the plist",
+                stable.display(),
+            );
+            format!(
+                "        <key>KB_PI_BIN</key>\n        <string>{}</string>\n",
+                stable.display(),
+            )
+        }
+    };
+
+    // ── Step 4c: resolve `node` bin dir ──────────────────────────────────────
+    //
+    // pi is a Node script (`#!/usr/bin/env node`).  When launchd spawns the
+    // daemon, its restricted PATH (the one in the plist) usually does not
+    // include fnm's or nvm's user-local bin directory — so pi exits in
+    // <1s with `env: node: No such file or directory` before producing
+    // any RPC events.  Adding the node-bin directory here fixes that and
+    // also makes `npm` / `npx` resolvable (pi uses them internally for
+    // package discovery).
+    let default_path = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
+    let plist_path_value = match crate::pi_resolver::locate_node_bin_dir() {
+        Some(node_dir)
+            if !default_path
+                .split(':')
+                .any(|p| Path::new(p) == node_dir.as_path()) =>
+        {
+            println!(
+                "  ✓  node bin dir       → {} (prepended to plist PATH)",
+                node_dir.display(),
+            );
+            format!("{}:{}", node_dir.display(), default_path)
+        }
+        Some(node_dir) => {
+            println!(
+                "  ✓  node bin dir       → {} (already in default PATH)",
+                node_dir.display(),
+            );
+            default_path.to_string()
+        }
+        None => {
+            println!(
+                "  ⚠️  `node` not found on PATH — the daemon will fail when\n\
+                 \t   pi tries to start (pi is a Node script).  Install Node.js\n\
+                 \t   (https://nodejs.org / fnm / nvm / brew install node) and\n\
+                 \t   re-run `kb install`."
+            );
+            default_path.to_string()
+        }
+    };
+
     // ── Step 5: plist destination ─────────────────────────────────────────────
     let la_dir = home.join("Library").join("LaunchAgents");
     std::fs::create_dir_all(&la_dir)
@@ -106,7 +189,9 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     let rendered = PLIST_TEMPLATE
         .replace("{{KB_BIN}}", &kb_bin_str)
         .replace("{{HOME}}", &home_str)
-        .replace("{{LOG_DIR}}", &log_dir);
+        .replace("{{LOG_DIR}}", &log_dir)
+        .replace("{{PLIST_PATH}}", &plist_path_value)
+        .replace("{{EXTRA_ENV_ENTRIES}}", &extra_env_entries);
 
     // ── Step 8: ensure LOG_DIR exists before launchd tries to open log files ──
     std::fs::create_dir_all(&log_dir)

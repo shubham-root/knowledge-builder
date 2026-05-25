@@ -222,6 +222,14 @@ Three common situations:
   decide whether to keep, move, or delete.  See [README → Safety
   model](README.md#safety-model) for what the audit can and can’t
   catch.
+* **`pi binary not found` _or_ `Agent ran for 0 turns` under launchd**
+  (fnm / nvm users).  Your shell-time PATH is invisible to launchd, so
+  the daemon can't find `pi` _and_ pi can't find `node` to interpret
+  its own `#!/usr/bin/env node` shebang.  `kb install` auto-detects
+  both: it bakes `KB_PI_BIN` and prepends node's bin directory to the
+  plist PATH.  If you still see this after `kb install`, run
+  `kb doctor` for a diagnostic, or override manually — see
+  [README → Troubleshooting](README.md#pi-binary-not-found--agent-ran-for-0-turns-under-launchd-fnm--nvm--volta).
 * **Large PDF takes hours.**  Look at `kb show <id>` — the
   per-batch timings tell you which pages are scanned vs text-native.
   Increase `KB_PDF_BATCH_TIMEOUT_SECS` in `secrets.env` if individual

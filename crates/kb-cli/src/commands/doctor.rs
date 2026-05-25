@@ -186,6 +186,54 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // ── Step 7: pi-coding-agent reachability ────────────────────────────
+    //
+    // The processor spawns `pi --mode rpc` for every job.  When the
+    // daemon runs under launchd, version-manager shims (fnm, nvm) on
+    // the operator's shell PATH are invisible because launchd does not
+    // execute shell init scripts.  This check resolves `pi` against
+    // the current shell's PATH, follows symlinks, and warns when the
+    // resolution lands on a per-session shim that won't be reachable
+    // from a daemon-managed process.
+    match crate::pi_resolver::locate_pi() {
+        crate::pi_resolver::PiLocation::Stable(p) => {
+            checker.pass(&format!(
+                "`pi` resolves to a stable path: {}", p.display(),
+            ));
+        }
+        crate::pi_resolver::PiLocation::PerShellShim { shim, stable, manager } => {
+            // Has the operator already pinned KB_PI_BIN somehow?  If
+            // they have, the warning is purely informational; if not,
+            // it's actionable.
+            let pinned = std::env::var_os("KB_PI_BIN").is_some()
+                      || secrets_has_kb_pi_bin();
+            if pinned {
+                checker.pass(&format!(
+                    "`pi` is at a {manager} per-shell shim ({}) but \
+                     KB_PI_BIN is already set; daemon will use the pinned path.",
+                    shim.display(),
+                ));
+            } else {
+                checker.warn(format!(
+                    "`pi` resolves to a {manager} per-shell shim ({}).\n\
+                     \t   This path is invisible to launchd-managed processes.\n\
+                     \t   `kb install` will auto-bake the stable path into the\n\
+                     \t   plist; if you run `kb daemon --foreground` from a non-\n\
+                     \t   shell context (e.g. a service manager other than\n\
+                     \t   launchd) you should also add to secrets.env:\n\
+                     \t     KB_PI_BIN={}",
+                    shim.display(), stable.display(),
+                ));
+            }
+        }
+        crate::pi_resolver::PiLocation::NotFound => {
+            checker.fail(format!(
+                "`pi` not found on PATH.  Install pi-coding-agent:\n\
+                 \t   npm install -g @earendil-works/pi-coding-agent"
+            ));
+        }
+    }
+
     // ── Final verdict ─────────────────────────────────────────────────────────
     checker.print_summary();
     if !checker.all_passed {
@@ -238,5 +286,18 @@ impl Checker {
                 "\u{2717}  One or more checks failed. Fix the issues above and re-run `kb doctor`."
             );
         }
+    }
+}
+
+// ── Internal: read secrets.env and check for KB_PI_BIN ────────────────────────
+
+/// Return `true` when the operator has set `KB_PI_BIN` in their
+/// `secrets.env` file.  Used by the pi-resolver check so that an
+/// operator who has already pinned the path doesn't see an actionable
+/// warning every time they run `kb doctor`.
+fn secrets_has_kb_pi_bin() -> bool {
+    match kb_core::load_secrets() {
+        Ok(s) => s.entries.contains_key("KB_PI_BIN"),
+        Err(_) => false,
     }
 }
