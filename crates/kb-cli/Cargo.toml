@@ -12,6 +12,7 @@ path = "src/main.rs"
 kb-core    = { workspace = true }
 kb-watcher = { workspace = true }
 kb-worker  = { workspace = true }
+kb-agent   = { path = "../kb-agent" }
 kb-ops     = { workspace = true }
 
 # CLI argument parsing
@@ -53,6 +54,9 @@ reqwest      = { workspace = true }
 
 # Async stream utilities (SSE tail stream)
 futures-util = { workspace = true }
+
+# Vault walking (kb relink subcommand)
+walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -91,6 +91,11 @@ enum Commands {
 
     /// Restore the state database from a backup file.
     Restore(commands::backup::RestoreArgs),
+
+    /// Recover wikilinks the legacy link-sweeper turned into
+    /// `Target [possible linkout - elaboration needed]` plain-text
+    /// placeholders.  Idempotent.
+    Relink(commands::relink::RelinkArgs),
 }
 
 #[tokio::main]
@@ -114,5 +119,6 @@ async fn main() -> Result<()> {
         Commands::Doctor         => commands::doctor::run().await,
         Commands::Backup(args)   => commands::backup::run_backup(args).await,
         Commands::Restore(args)  => commands::backup::run_restore(args).await,
+        Commands::Relink(args)   => commands::relink::run(args).await,
     }
 }

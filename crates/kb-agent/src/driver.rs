@@ -726,7 +726,8 @@ mod tests {
 
     #[test]
     fn timeout_floor_is_60s() {
-        // SAFETY: env mutation in single-threaded test.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_LOCK; nothing else reads the var.
         unsafe { std::env::set_var("KB_AGENT_TIMEOUT_SECS", "10"); }
         assert_eq!(agent_timeout_secs(), 60);
         unsafe { std::env::remove_var("KB_AGENT_TIMEOUT_SECS"); }
@@ -734,7 +735,8 @@ mod tests {
 
     #[test]
     fn timeout_default_when_unset() {
-        // SAFETY: env mutation in single-threaded test.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by ENV_LOCK.
         unsafe { std::env::remove_var("KB_AGENT_TIMEOUT_SECS"); }
         assert_eq!(agent_timeout_secs(), DEFAULT_AGENT_TIMEOUT_SECS);
     }

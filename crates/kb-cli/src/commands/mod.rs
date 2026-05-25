@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod install;
 pub mod list;
 pub mod prune;
+pub mod relink;
 pub mod requeue;
 pub mod reset;
 pub mod scan;

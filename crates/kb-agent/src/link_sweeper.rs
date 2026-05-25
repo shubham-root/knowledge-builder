@@ -1,33 +1,35 @@
-//! Post-run link sweeper for the Knowledge Builder agent.
+//! Post-run wikilink reporter for the Knowledge Builder agent.
 //!
 //! After the agent finishes in *apply* mode, walk every file it
-//! created or modified, find any `[[wikilink]]` that resolves to no
-//! existing note, and rewrite it in-place to a plain-text placeholder
-//! of the form:
+//! created or modified, count any `[[wikilink]]` that resolves to no
+//! existing note, and surface the count in result metadata.  Until
+//! 2026-05-26 this module *also rewrote* unresolved links to plain
+//! text (`Target [possible linkout - elaboration needed]`).  That
+//! rewrite turned out to be hostile to Obsidian's intended use of
+//! wikilinks: a `[[Target]]` whose note doesn't exist is a *feature*
+//! — it appears as a stub in the graph view and one click creates
+//! the note.  The agent legitimately uses these links to plant the
+//! "concepts worth a future note" signal that makes the vault
+//! organic.
 //!
-//! ```text
-//! Target [possible linkout - elaboration needed]
-//! ```
-//!
-//! This is a deterministic backstop for prompt-level discipline: the
-//! LLM is instructed to avoid creating broken links in the first
-//! place, and the sweeper guarantees the invariant regardless of
-//! model compliance.
+//! This module now *reports* the count of unresolved wikilinks but
+//! does **not** modify the files.  A separate companion function,
+//! [`relink_files`], performs the inverse rewrite — turning legacy
+//! `Target [possible linkout - elaboration needed]` placeholders back
+//! into `[[Target]]` form so vaults that suffered the old behaviour
+//! can be repaired.  It is exposed via `kb relink`.
 //!
 //! # Design constraints
 //!
-//! * Only runs in `apply` mode — in `shadow` mode the agent's content
-//!   has not been written to disk so there is nothing to sweep.
-//! * Only touches files inside `agent_root` (the agent's mutation
-//!   sandbox).  User-authored notes elsewhere in the vault are out of
-//!   scope.
-//! * Code-fenced blocks (`` ``` ... ``` ``) and inline code (`` ` ` ``)
-//!   are preserved verbatim — they may legitimately contain example
-//!   wikilink syntax that should not be rewritten.
-//! * Wikilinks pointing at notes the agent just created are resolved
-//!   correctly: the existing-notes index is built from a fresh vault
-//!   walk **after** the agent finishes, so newly-created notes are
-//!   already indexed.
+//! * Only walks files inside `agent_root` (the agent's mutation
+//!   sandbox).  User-authored notes elsewhere in the vault are out
+//!   of scope.
+//! * Code-fenced blocks (`` ``` ... ``` ``) and inline code
+//!   (`` ` ` ``) are preserved verbatim — they may legitimately
+//!   contain example wikilink syntax.
+//! * Wikilinks pointing at notes the agent just created are
+//!   resolved correctly: the existing-notes index is built from a
+//!   fresh vault walk **after** the agent finishes.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -267,12 +269,13 @@ pub fn sweep_links_in_text(
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-/// Sweep every file in `files`.
+/// Walk every file in `files`, count any unresolved wikilinks, and
+/// return aggregate stats.  **Does not modify the files** — unresolved
+/// wikilinks are a legitimate Obsidian convention for "concepts worth
+/// a future note" and the previous rewriting behaviour was hostile to
+/// the graph-view UX.  See module docs.
 ///
-/// For each file inside `agent_root` that contains at least one
-/// unresolved wikilink, the file is rewritten in-place with placeholder
-/// text.  Files outside `agent_root` are silently skipped — the
-/// sweeper is not authorised to modify user-authored content.
+/// Files outside `agent_root` are silently skipped.
 pub fn sweep_files(
     files:        impl IntoIterator<Item = PathBuf>,
     vault_root:   &Path,
@@ -289,9 +292,6 @@ pub fn sweep_files(
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for raw in files {
         stats.files_input += 1;
-        // Try to canonicalize for the (in-agent-root) check; tolerate
-        // non-existent paths so we can report `skipped_not_a_file`
-        // distinctly from `skipped_outside_root`.
         let path = match raw.canonicalize() {
             Ok(p)  => p,
             Err(_) => raw.clone(),
@@ -301,9 +301,6 @@ pub fn sweep_files(
         }
         seen.insert(path.clone());
 
-        // 1. Existence first.  When the plan path drifted from disk
-        //    reality (Obsidian auto-disambiguation), we want the
-        //    plan/disk drift counter, not the outside-root one.
         if !path.is_file() {
             warn!(
                 target: "kb_agent::link_sweeper",
@@ -314,11 +311,6 @@ pub fn sweep_files(
             stats.skipped_not_a_file += 1;
             continue;
         }
-
-        // 2. Confine to agent_root.  We require both the path and
-        //    `agent_root` to be canonicalized; mismatched representations
-        //    (e.g. /var vs /private/var on macOS) would otherwise
-        //    spuriously falsy a containment check.
         if !path.starts_with(&agent_root_canon) {
             debug!(
                 target: "kb_agent::link_sweeper",
@@ -347,35 +339,43 @@ pub fn sweep_files(
             }
         };
         stats.files_examined += 1;
-        let (new_content, replaced) = sweep_links_in_text(&content, &existing);
-        if replaced.is_empty() {
+        let unresolved = unresolved_links_in_text(&content, &existing);
+        if unresolved.is_empty() {
             continue;
         }
-        if let Err(e) = std::fs::write(&path, &new_content) {
-            warn!(
-                target: "kb_agent::link_sweeper",
-                "cannot write {}: {e}", path.display(),
-            );
-            continue;
-        }
-        stats.files_modified += 1;
-        stats.links_replaced += replaced.len();
+        // Note: we DO NOT modify the file.  We only report the count.
+        stats.files_modified += 0;
+        stats.links_replaced += unresolved.len();
         let fname = path.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        for link in replaced.iter().take(5) {
+        for link in unresolved.iter().take(5) {
             stats.examples.push(format!("{}: [[{}]]", fname, link.target));
         }
         info!(
             target: "kb_agent::link_sweeper",
-            "{} — replaced {} unresolved link(s): {:?}",
+            "{} contains {} unresolved wikilink(s) (kept as-is): {:?}",
             fname,
-            replaced.len(),
-            replaced.iter().map(|l| l.target.as_str()).collect::<Vec<_>>(),
+            unresolved.len(),
+            unresolved.iter().map(|l| l.target.as_str()).collect::<Vec<_>>(),
         );
     }
     stats
+}
+
+/// Inventory unresolved wikilinks in `content` without modifying it.
+///
+/// This is the read-only twin of [`sweep_links_in_text`].  Used by
+/// [`sweep_files`] for report-only mode.
+pub fn unresolved_links_in_text(
+    content:  &str,
+    existing: &HashSet<String>,
+) -> Vec<UnresolvedLink> {
+    // Reuse sweep_links_in_text by discarding its rewritten output.
+    // Code-fence preservation and alias/section parsing are identical.
+    let (_, replaced) = sweep_links_in_text(content, existing);
+    replaced
 }
 
 // ── Plan helpers ─────────────────────────────────────────────────────────────
@@ -411,6 +411,224 @@ pub fn files_touched_by_plan(
     out
 }
 
+// ── Recovery: undo the legacy "possible linkout" rewrite ───────────────
+
+/// Aggregate stats from a [`relink_files`] run.
+#[derive(Debug, Clone, Default)]
+pub struct RelinkStats {
+    /// Total files passed in.
+    pub files_input: usize,
+    /// Files actually opened and scanned.
+    pub files_examined: usize,
+    /// Files where at least one rewrite was applied.
+    pub files_modified: usize,
+    /// Total `Target [possible linkout - elaboration needed]` placeholders
+    /// converted back to `[[Target]]`.
+    pub links_restored: usize,
+    /// First few rewrites — `"<filename>: [[Target]]"`.
+    pub examples: Vec<String>,
+}
+
+/// Pattern emitted by the legacy sweeper:
+///
+/// * `"Foo [possible linkout - elaboration needed]"`
+/// * `"alias [possible linkout - elaboration needed]"`            (`[[Foo|alias]]`)
+/// * `"Foo (§Section) [possible linkout - elaboration needed]"`    (`[[Foo#Section]]`)
+/// * `"alias (§Section) [possible linkout - elaboration needed]"`  (`[[Foo#Section|alias]]`)
+///
+/// We can recover the wikilink form for the simple case (no alias, no
+/// section) deterministically.  For aliased / sectioned forms we make
+/// the most useful guess: `[[alias]]`, `[[target#section]]`,
+/// `[[target#section|alias]]`.  Note we can't recover the *original*
+/// target when only an alias survived — the legacy sweeper threw it
+/// away.  Best we can do is wikilink the alias text directly, which
+/// at least restores the click-to-create affordance.
+const SUFFIX: &str = " [possible linkout - elaboration needed]";
+#[allow(dead_code)] // referenced symbolically in the regex below.
+const _: &str = SUFFIX;
+
+/// Walk every file in `files` (markdown only, inside `agent_root` per
+/// the same containment rules as [`sweep_files`]) and rewrite legacy
+/// `Target [possible linkout - elaboration needed]` placeholders back
+/// into wikilink form `[[Target]]`.
+///
+/// **Idempotent**: running it twice on the same file is a no-op the
+/// second time (the placeholder pattern no longer matches).
+///
+/// Code-fenced and inline-code spans are preserved verbatim — if a
+/// user ever wrote the literal placeholder string inside ``` `code` ```
+/// for documentation purposes, we leave it alone.
+///
+/// Returns aggregate [`RelinkStats`].  Files outside `agent_root` or
+/// non-markdown files are silently skipped.
+pub fn relink_files(
+    files:      impl IntoIterator<Item = PathBuf>,
+    agent_root: &Path,
+    dry_run:    bool,
+) -> RelinkStats {
+    let mut stats = RelinkStats::default();
+    let agent_root_canon = agent_root
+        .canonicalize()
+        .unwrap_or_else(|_| agent_root.to_path_buf());
+
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    for raw in files {
+        stats.files_input += 1;
+        let path = match raw.canonicalize() {
+            Ok(p)  => p,
+            Err(_) => raw.clone(),
+        };
+        if seen.contains(&path) { continue; }
+        seen.insert(path.clone());
+
+        if !path.is_file() { continue; }
+        if !path.starts_with(&agent_root_canon) { continue; }
+        let is_md = path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_md { continue; }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c)  => c,
+            Err(e) => {
+                warn!(
+                    target: "kb_agent::link_sweeper",
+                    "relink: cannot read {}: {e}", path.display(),
+                );
+                continue;
+            }
+        };
+        stats.files_examined += 1;
+
+        let (new_content, restored) = relink_text(&content);
+        if restored.is_empty() {
+            continue;
+        }
+        let fname = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        for r in restored.iter().take(5) {
+            stats.examples.push(format!("{fname}: [[{r}]]"));
+        }
+        stats.links_restored += restored.len();
+        if dry_run {
+            info!(
+                target: "kb_agent::link_sweeper",
+                "relink (DRY-RUN): would restore {} link(s) in {}",
+                restored.len(), fname,
+            );
+            continue;
+        }
+        match std::fs::write(&path, &new_content) {
+            Ok(()) => {
+                stats.files_modified += 1;
+                info!(
+                    target: "kb_agent::link_sweeper",
+                    "relink: restored {} link(s) in {}: {:?}",
+                    restored.len(), fname, restored.iter().take(5).collect::<Vec<_>>(),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "kb_agent::link_sweeper",
+                    "relink: cannot write {}: {e}", path.display(),
+                );
+            }
+        }
+    }
+    stats
+}
+
+/// Convert every `<text>[possible linkout - elaboration needed]`
+/// placeholder in `content` back to `[[<text>]]` form, preserving
+/// fenced code blocks and inline code verbatim.
+///
+/// Returns `(new_content, restored)` where `restored` is the list of
+/// the inferred wikilink target strings (without brackets) in document
+/// order.
+pub fn relink_text(content: &str) -> (String, Vec<String>) {
+    use regex::Regex;
+
+    // Stash code so the rewrite can't touch wikilink-syntax examples.
+    let fenced = Regex::new(FENCED_CODE_PATTERN).expect("FENCED_CODE_PATTERN compiles");
+    let inline = Regex::new(INLINE_CODE_PATTERN).expect("INLINE_CODE_PATTERN compiles");
+
+    let mut stash: Vec<String> = Vec::new();
+    let stash_token = |i: usize| format!("\u{0}KBRELINK\u{0}BLOCK\u{0}{i}\u{0}");
+
+    let mut work = String::with_capacity(content.len());
+    let mut last = 0usize;
+    for m in fenced.find_iter(content) {
+        work.push_str(&content[last..m.start()]);
+        stash.push(m.as_str().to_string());
+        work.push_str(&stash_token(stash.len() - 1));
+        last = m.end();
+    }
+    work.push_str(&content[last..]);
+
+    let mut work2 = String::with_capacity(work.len());
+    let mut last2 = 0usize;
+    for m in inline.find_iter(&work) {
+        work2.push_str(&work[last2..m.start()]);
+        stash.push(m.as_str().to_string());
+        work2.push_str(&stash_token(stash.len() - 1));
+        last2 = m.end();
+    }
+    work2.push_str(&work[last2..]);
+
+    // Match any `[possible linkout - elaboration needed]` placeholder
+    // that consumes a complete line (with optional leading list /
+    // blockquote markers).  This is the *only* shape the legacy
+    // Python sweeper actually produced in the wild — the agent always
+    // dropped its wikilink stubs as bullet items.
+    //
+    //  Group 1: leading whitespace + list/blockquote markers (preserved)
+    //  Group 2: target text
+    //  Group 3 (optional): section name (between `(§` and `)`)
+    //
+    // Inline mid-prose placeholders like `"Body Foo [possible …]"`
+    // are deliberately NOT matched: there is no robust boundary that
+    // identifies where "Foo" starts versus where the surrounding
+    // prose ends, so any heuristic risks corrupting user text.  In
+    // the wild we have not observed the sweeper producing those, so
+    // leaving them untouched is correct.
+    let pattern = Regex::new(
+        // Leading group MUST be non-empty: in the wild the legacy
+        // sweeper produced bullet items (`- Target [...]`).  Requiring
+        // a non-empty leading whitespace / list marker means we never
+        // mistake a prose paragraph (`Sentence Foo [...].`) for a
+        // sweep output and accidentally rewrite "Sentence Foo" as a
+        // wikilink.
+        r"(?m)^([\s\-*>]+)([^\n\[\]]+?)(?: \(§([^)\n]+)\))? \[possible linkout - elaboration needed\]",
+    ).expect("relink pattern compiles");
+
+    let mut restored: Vec<String> = Vec::new();
+    let swept = pattern.replace_all(&work2, |caps: &regex::Captures<'_>| {
+        let leading = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let display = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        let section = caps.get(3).map(|m| m.as_str().trim().to_string());
+        if display.is_empty() {
+            // Defensive: don't produce an empty `[[]]`; preserve the
+            // original (matched) text by re-emitting it.
+            return caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+        }
+        let target = match &section {
+            Some(s) if !s.is_empty() => format!("{display}#{s}"),
+            _                        => display.to_string(),
+        };
+        restored.push(target.clone());
+        format!("{leading}[[{target}]]")
+    });
+
+    // Restore code blocks.
+    let mut out = swept.into_owned();
+    for (i, block) in stash.iter().enumerate() {
+        out = out.replace(&stash_token(i), block);
+    }
+    (out, restored)
+}
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -601,17 +819,151 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_unresolved_inside_agent_root() {
+    fn reports_unresolved_inside_agent_root_without_modifying_file() {
+        // After 2026-05-26, sweep_files is report-only.  The file
+        // content must remain untouched even when wikilinks are
+        // unresolved — unresolved wikilinks are a feature in Obsidian.
         let v = setup();
         let target = v.kb.join("New.md");
         write(&target, "Body [[Missing]] body.");
+        let before = fs::read_to_string(&target).unwrap();
         let stats = sweep_files(vec![target.clone()], &v.vault, &v.sources, &v.kb);
         assert_eq!(stats.files_examined,  1);
-        assert_eq!(stats.files_modified,  1);
-        assert_eq!(stats.links_replaced,  1);
+        assert_eq!(stats.files_modified,  0, "sweeper must NOT modify the file");
+        assert_eq!(stats.links_replaced,  1, "counted in stats only");
         let after = fs::read_to_string(&target).unwrap();
-        assert!(after.contains("Missing [possible linkout - elaboration needed]"));
-        assert!(!after.contains("[[Missing]]"));
+        assert_eq!(after, before, "file content must be untouched");
+        assert!(after.contains("[[Missing]]"));
+        assert!(!after.contains("possible linkout"),
+            "sweep_files no longer rewrites unresolved links");
+    }
+
+    #[test]
+    fn relink_text_restores_simple_target_in_list() {
+        let input  = "- Foo [possible linkout - elaboration needed]";
+        let (out, restored) = relink_text(input);
+        assert_eq!(out,      "- [[Foo]]");
+        assert_eq!(restored, vec!["Foo".to_string()]);
+    }
+
+    #[test]
+    fn relink_text_restores_section_form_in_list() {
+        let input  = "- Bar (§Intro) [possible linkout - elaboration needed]";
+        let (out, restored) = relink_text(input);
+        assert_eq!(out, "- [[Bar#Intro]]");
+        assert_eq!(restored, vec!["Bar#Intro".to_string()]);
+    }
+
+    #[test]
+    fn relink_text_preserves_complex_targets_with_dashes_and_colons() {
+        let cases = &[
+            ("- MEMO - Memory-Based Knowledge Injection [possible linkout - elaboration needed]",
+             "- [[MEMO - Memory-Based Knowledge Injection]]",
+             "MEMO - Memory-Based Knowledge Injection"),
+            ("- TIES-Merging: Resolving Interference When Merging Models [possible linkout - elaboration needed]",
+             "- [[TIES-Merging: Resolving Interference When Merging Models]]",
+             "TIES-Merging: Resolving Interference When Merging Models"),
+            ("- Retrieval-Augmented Generation [possible linkout - elaboration needed]",
+             "- [[Retrieval-Augmented Generation]]",
+             "Retrieval-Augmented Generation"),
+        ];
+        for (input, expected_out, expected_target) in cases {
+            let (out, restored) = relink_text(input);
+            assert_eq!(&out, expected_out, "input: {input:?}");
+            assert_eq!(restored, vec![expected_target.to_string()]);
+        }
+    }
+
+    #[test]
+    fn relink_text_handles_multiple_sequential_list_items() {
+        let input = "- A [possible linkout - elaboration needed]\n\
+                     - B [possible linkout - elaboration needed]\n\
+                     - C (§sec) [possible linkout - elaboration needed]";
+        let (out, restored) = relink_text(input);
+        assert_eq!(out, "- [[A]]\n- [[B]]\n- [[C#sec]]");
+        assert_eq!(restored, vec!["A".to_string(), "B".to_string(), "C#sec".to_string()]);
+    }
+
+    #[test]
+    fn relink_text_preserves_fenced_code() {
+        let input = "```\n- Looks like Foo [possible linkout - elaboration needed]\n```\n- Real Bar [possible linkout - elaboration needed]";
+        let (out, restored) = relink_text(input);
+        assert!(out.contains("```\n- Looks like Foo [possible linkout - elaboration needed]\n```"),
+            "fenced block preserved verbatim, got: {out}");
+        assert!(out.contains("- [[Real Bar]]"));
+        assert_eq!(restored, vec!["Real Bar".to_string()]);
+    }
+
+    #[test]
+    fn relink_text_preserves_trailing_prose_after_placeholder() {
+        // Real-world shape from the Transformer paper note: the legacy
+        // sweeper rewrote `[[Foo]]` even when the line continued with
+        // descriptive text after the wikilink.  Recovery must preserve
+        // that trailing prose.
+        let input = "- Machine Translation [possible linkout - elaboration needed] — primary application";
+        let (out, restored) = relink_text(input);
+        assert_eq!(out, "- [[Machine Translation]] — primary application");
+        assert_eq!(restored, vec!["Machine Translation".to_string()]);
+    }
+
+    #[test]
+    fn relink_text_idempotent() {
+        let input = "- Foo [possible linkout - elaboration needed]";
+        let (once, _) = relink_text(input);
+        let (twice, restored2) = relink_text(&once);
+        assert_eq!(once, twice, "second run must be no-op");
+        assert!(restored2.is_empty());
+    }
+
+    #[test]
+    fn relink_text_does_not_touch_inline_mid_prose_occurrences() {
+        // We deliberately don't recover inline mid-prose placeholders
+        // because there's no robust boundary for the target text.
+        // Documented limitation — in practice the legacy sweeper
+        // produced bullet-list items, not inline rewrites.
+        let input = "See Foo [possible linkout - elaboration needed].";
+        let (out, restored) = relink_text(input);
+        assert_eq!(out, input);
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn relink_files_rewrites_in_place_inside_agent_root() {
+        let v = setup();
+        let f = v.kb.join("Recovery.md");
+        write(&f, "Body\n- MEMO - Memory-Embedded [possible linkout - elaboration needed]\nbody.");
+        let stats = relink_files(vec![f.clone()], &v.kb, /* dry_run */ false);
+        assert_eq!(stats.files_input,    1);
+        assert_eq!(stats.files_examined, 1);
+        assert_eq!(stats.files_modified, 1);
+        assert_eq!(stats.links_restored, 1);
+        let after = fs::read_to_string(&f).unwrap();
+        assert!(after.contains("- [[MEMO - Memory-Embedded]]"), "got: {after}");
+        assert!(!after.contains("possible linkout"));
+    }
+
+    #[test]
+    fn relink_files_dry_run_does_not_write() {
+        let v = setup();
+        let f = v.kb.join("Dry.md");
+        let before = "- Foo [possible linkout - elaboration needed]";
+        write(&f, before);
+        let stats = relink_files(vec![f.clone()], &v.kb, /* dry_run */ true);
+        assert_eq!(stats.files_modified, 0);
+        assert_eq!(stats.links_restored, 1);
+        let after = fs::read_to_string(&f).unwrap();
+        assert_eq!(after, before, "dry-run must not touch the file");
+    }
+
+    #[test]
+    fn relink_files_skips_outside_agent_root() {
+        let v = setup();
+        let outside = v.vault.join("NotInKB.md");
+        write(&outside, "- X [possible linkout - elaboration needed]");
+        let stats = relink_files(vec![outside.clone()], &v.kb, /* dry_run */ false);
+        assert_eq!(stats.files_examined, 0);
+        assert_eq!(stats.links_restored, 0);
+        assert!(fs::read_to_string(&outside).unwrap().contains("possible linkout"));
     }
 
     #[test]

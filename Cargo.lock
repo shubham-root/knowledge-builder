@@ -2213,6 +2213,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "globset",
+ "kb-agent",
  "kb-core",
  "kb-ops",
  "kb-watcher",
@@ -2225,6 +2226,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
