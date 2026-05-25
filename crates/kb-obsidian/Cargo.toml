@@ -1,0 +1,32 @@
+[package]
+name        = "kb-obsidian"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Policy wrapper around the Obsidian CLI for the Knowledge Builder agent."
+
+# Single executable.  Staged on the agent's PATH at job time so the
+# agent's `bash` tool sees `kb-obsidian <cmd> [key=value]...` and routes
+# everything through the path-invariant + plan-file machinery here.
+[[bin]]
+name = "kb-obsidian"
+path = "src/main.rs"
+
+[dependencies]
+kb-core      = { path = "../kb-core" }
+kb-agent     = { path = "../kb-agent" }
+
+# Serialization for the JSON status responses to stdout
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+# Error handling
+anyhow       = { workspace = true }
+
+# Logging (kept light — the wrapper is invoked once per agent action)
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tempfile     = { workspace = true }
+assert_cmd   = { workspace = true }
+predicates   = { workspace = true }

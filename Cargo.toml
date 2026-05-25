@@ -5,6 +5,8 @@ members = [
     "crates/kb-watcher",
     "crates/kb-worker",
     "crates/kb-extractor",
+    "crates/kb-agent",
+    "crates/kb-obsidian",
     "crates/kb-ops",
     "crates/kb-cli",
     "tests/integration",
@@ -35,6 +37,9 @@ tracing-appender = { version = "0.2" }
 
 # TTY detection
 libc             = { version = "0.2" }
+
+assert_cmd       = { version = "2" }
+predicates       = { version = "3" }
 
 # SQLite (statically linked)
 rusqlite         = { version = "0.32", features = ["bundled"] }

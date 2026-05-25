@@ -1,0 +1,33 @@
+[package]
+name        = "kb-agent"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Agent driver, plan parser, and link sweeper for Knowledge Builder."
+
+[dependencies]
+kb-core      = { path = "../kb-core" }
+
+# Async runtime
+tokio        = { workspace = true }
+
+# Serialization (plan JSONL is bit-identical to the Python wrapper's output)
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+# Error handling
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+
+# Logging
+tracing      = { workspace = true }
+
+# Regex for the wikilink rewriter
+regex        = "1"
+
+# Walking the vault to build the existing-note index
+walkdir      = "2"
+
+[dev-dependencies]
+tempfile     = { workspace = true }
+tokio        = { workspace = true }
